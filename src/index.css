@@ -1,0 +1,213 @@
+@import "tailwindcss";
+
+/* Theme tokens. Light by default, dark follows the OS. */
+:root {
+  --bg: #f6f6f4;
+  --surface: #ffffff;
+  --surface-2: #efefec;
+  --border: #e3e3df;
+  --fg: #1c1c1a;
+  --muted: #6b6b66;
+  --faint: #9b9b95;
+  --accent: #4f46e5;
+  --accent-soft: #e9e8fd;
+  --st-progress: #2563eb;
+  --st-waiting: #7c3aed;
+  --st-review: #0f766e;
+  --st-blocked: #dc2626;
+  --st-todo: #57534e;
+  --st-backlog: #a8a29e;
+  --st-done: #16a34a;
+  --p0: #dc2626;
+  --p1: #ea580c;
+  --p2: #78716c;
+  --p3: #a8a29e;
+  --pr-open: #1a7f37;
+  --pr-merged: #8250df;
+  --warn: #b45309;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141413;
+    --surface: #1c1c1b;
+    --surface-2: #262624;
+    --border: #2f2f2c;
+    --fg: #ececea;
+    --muted: #a3a39d;
+    --faint: #6f6f6a;
+    --accent: #8b85ff;
+    --accent-soft: #2a2850;
+    --st-progress: #60a5fa;
+    --st-waiting: #a78bfa;
+    --st-review: #2dd4bf;
+    --st-blocked: #f87171;
+    --st-todo: #d6d3d1;
+    --st-backlog: #78716c;
+    --st-done: #4ade80;
+    --p0: #f87171;
+    --p1: #fb923c;
+    --p2: #a8a29e;
+    --p3: #78716c;
+    --pr-open: #3fb950;
+    --pr-merged: #a371f7;
+    --warn: #f0b429;
+    color-scheme: dark;
+  }
+}
+
+@theme {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-line: var(--border);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "Cascadia Code", Consolas, ui-monospace, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+input,
+textarea,
+.selectable {
+  user-select: text;
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+/* Component classes live in a layer so Tailwind utilities (w-40, py-1, …) can override them. */
+@layer components {
+  .field {
+    width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    color: var(--fg);
+    outline: none;
+  }
+  .field:focus {
+    border-color: var(--accent);
+  }
+  .field::placeholder {
+    color: var(--faint);
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border-radius: 6px;
+    padding: 5px 10px;
+    font-size: 13px;
+    color: var(--fg);
+    border: 1px solid var(--border);
+    background: var(--surface);
+    cursor: default;
+  }
+  .btn:hover {
+    background: var(--surface-2);
+  }
+  .btn:disabled {
+    opacity: 0.5;
+  }
+  .btn-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: white;
+  }
+  .btn-primary:hover {
+    background: var(--accent);
+    filter: brightness(1.08);
+  }
+  .btn-ghost {
+    border-color: transparent;
+    background: transparent;
+    color: var(--muted);
+  }
+  .btn-ghost:hover {
+    color: var(--fg);
+  }
+
+  kbd {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--muted);
+  }
+}
+
+/* Markdown output from summaries */
+.md {
+  line-height: 1.55;
+  user-select: text;
+}
+.md > * + * {
+  margin-top: 0.6em;
+}
+.md h1,
+.md h2,
+.md h3 {
+  font-weight: 600;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-top: 1.1em;
+}
+.md ul {
+  list-style: disc;
+  padding-left: 1.2em;
+}
+.md ol {
+  list-style: decimal;
+  padding-left: 1.2em;
+}
+.md li + li {
+  margin-top: 0.25em;
+}
+.md strong {
+  font-weight: 600;
+}
+.md code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--surface-2);
+  padding: 0 4px;
+  border-radius: 4px;
+}
