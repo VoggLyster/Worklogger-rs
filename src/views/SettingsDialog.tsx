@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Archive } from "lucide-react";
 import { api, errorMessage, type HotkeyStatus, type SettingKey } from "../lib/api";
+import { isMac } from "../lib/hotkeys";
 import { useStore } from "../lib/store";
 import { Modal, Spinner } from "../components/ui";
 
@@ -121,7 +122,7 @@ function SettingsBody() {
         <Row label="Global hotkey" hint="Brings WorkLogger to the front with the capture bar focused, from any app.">
           <input
             className="field"
-            placeholder="ctrl+alt+n"
+            placeholder={isMac ? "cmd+alt+n" : "ctrl+alt+n"}
             defaultValue={field("hotkey")}
             onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
             onBlur={async (e) => {

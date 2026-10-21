@@ -5,6 +5,15 @@ import { STATUS_ORDER } from "./meta";
 import { useStore } from "./store";
 import { visibleTaskIds } from "./sections";
 
+export const isMac =
+  typeof navigator !== "undefined" &&
+  (/Mac|iPhone|iPad|iPod/i.test(navigator.platform || "") || /Mac OS X/i.test(navigator.userAgent || ""));
+
+/** Platform-friendly label for the default global hotkey. */
+export const defaultGlobalHotkeyLabel = isMac ? "⌘⌥N" : "Ctrl+Alt+N";
+/** Platform-friendly label for the "submit textarea" shortcut. */
+export const submitShortcutLabel = isMac ? "⌘+Enter" : "Ctrl+Enter";
+
 export const SHORTCUTS: [string, string][] = [
   ["N", "New task (focus capture bar)"],
   ["/", "Search"],
@@ -20,7 +29,7 @@ export const SHORTCUTS: [string, string][] = [
   ["← / →", "Previous / next day (Journal)"],
   ["Esc", "Close / clear"],
   ["?", "This help"],
-  ["Ctrl+Alt+N", "Global: bring WorkLogger up and capture (configurable)"],
+  [defaultGlobalHotkeyLabel, "Global: bring WorkLogger up and capture (configurable)"],
 ];
 
 function isField(el: EventTarget | Element | null): boolean {

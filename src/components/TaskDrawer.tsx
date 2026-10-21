@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Archive, Bookmark, ExternalLink, X } from "lucide-react";
 import { openExternal } from "../lib/open";
 import { api, errorMessage, type Activity, type Task, type TaskPatch } from "../lib/api";
+import { submitShortcutLabel } from "../lib/hotkeys";
 import { PRIORITY, STATUS, STATUS_ORDER } from "../lib/meta";
 import { useStore } from "../lib/store";
 import { fmtDayTime } from "../lib/time";
@@ -180,7 +181,7 @@ function DrawerBody({ task, onClose }: { task: Task; onClose(): void }) {
               ref={noteRef}
               data-note
               className="block min-h-14 w-full resize-y bg-transparent px-2.5 py-2 text-[13px] outline-none placeholder:text-faint"
-              placeholder="Log progress, a decision, what the agent did…   (Ctrl+Enter)"
+              placeholder={`Log progress, a decision, what the agent did…   (${submitShortcutLabel})`}
               value={note}
               onChange={(e) => setNote(e.target.value)}
               onKeyDown={(e) => {

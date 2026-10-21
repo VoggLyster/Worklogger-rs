@@ -15,6 +15,7 @@ import type {
   Task,
   TaskPatch,
 } from "./api";
+import { isMac } from "./hotkeys";
 
 /** Fake snapshot so the PR UI can be previewed without GitHub. */
 function demoSnapshot(repo: string, number: number, title: string, extra: Partial<PrSnapshot> = {}): PrSnapshot {
@@ -37,6 +38,7 @@ export function createMemoryBackend(): Backend {
   const prs: PrRow[] = [];
   const inbox: SearchPr[] = [];
   const settings: Settings = {};
+  const defaultHotkey = isMac ? "cmd+alt+n" : "ctrl+alt+n";
 
   const log = (task_id: number, kind: ActivityKind, body = "", meta: Record<string, unknown> = {}, at = Date.now()) => {
     const a = { id: id(), task_id, kind, body, meta, created_at: at };
@@ -241,11 +243,11 @@ export function createMemoryBackend(): Backend {
       throw new Error("Not available in browser preview");
     },
     async hotkeyStatus() {
-      return { combo: settings.hotkey || "ctrl+alt+n", error: "Global hotkeys need the desktop app" };
+      return { combo: settings.hotkey || defaultHotkey, error: "Global hotkeys need the desktop app" };
     },
     async setHotkey(combo) {
       settings.hotkey = combo;
-      return { combo: combo || "ctrl+alt+n", error: "Global hotkeys need the desktop app" };
+      return { combo: combo || defaultHotkey, error: "Global hotkeys need the desktop app" };
     },
   };
 

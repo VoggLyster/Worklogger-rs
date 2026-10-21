@@ -364,6 +364,17 @@ pub fn resolve_gh(setting: Option<String>) -> PathBuf {
             return p.to_path_buf();
         }
     }
+    // Bundled .app launches from Finder don't inherit the shell PATH, so fall back
+    // to the common Homebrew locations before giving up to a bare "gh".
+    #[cfg(target_os = "macos")]
+    {
+        for p in ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
+            let p = Path::new(p);
+            if p.exists() {
+                return p.to_path_buf();
+            }
+        }
+    }
     PathBuf::from("gh")
 }
 

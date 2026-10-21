@@ -9,6 +9,9 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::ShortcutState;
 
+#[cfg(target_os = "macos")]
+pub const DEFAULT_HOTKEY: &str = "cmd+alt+n";
+#[cfg(not(target_os = "macos"))]
 pub const DEFAULT_HOTKEY: &str = "ctrl+alt+n";
 
 fn show_main(app: &AppHandle) {

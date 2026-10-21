@@ -5,7 +5,7 @@ and coming back to them without losing the thread.
 
 - **Focus view**: In progress, Waiting on agent, In review and Blocked on the left; Up next, Backlog and Done today on the right.
   Tasks sort by priority, then by manual drag order.
-- **Quick capture** with inline syntax, plus a global hotkey (`Ctrl+Alt+N` by default) that brings the window up from anywhere.
+- **Quick capture** with inline syntax, plus a global hotkey (`Ctrl+Alt+N` on Windows/Linux, `⌘⌥N` on macOS, configurable) that brings the window up from anywhere.
 - **Park**: when you switch away from an in-progress task, WorkLogger asks *"Where are you leaving this?"*. The answer
   becomes the task's **next step**, shown on every card.
 - **Progress log** per task. Status, priority and completion changes are recorded automatically, and you add notes.
@@ -58,7 +58,11 @@ a terminal and use `/login`. You can change the model and the CLI path in Settin
 
 ## Development
 
-Requires Node 20+, Rust (stable, MSVC) and WebView2 (preinstalled on Windows 11).
+Requires Node 20+ and Rust (stable).
+
+- **Windows:** Rust with the MSVC toolchain, and WebView2 (preinstalled on Windows 11).
+- **macOS:** Xcode Command Line Tools (`xcode-select --install`); the webview uses the system WebKit.
+- **Linux:** `webkit2gtk-4.1` and the usual build essentials.
 
 ```bash
 npm install
@@ -67,10 +71,20 @@ npm run dev            # UI only in a browser, with an in-memory demo backend
 npm test               # frontend unit tests
 cd src-tauri && cargo test                                    # Rust unit tests
 cd src-tauri && WORKLOGGER_LIVE_PR=owner/repo#123 cargo test -- --ignored --nocapture  # live checks (Claude CLI, gh)
-npm run tauri build    # release build + NSIS installer in src-tauri/target/release/bundle
+npm run tauri build    # release build in src-tauri/target/release/bundle
 ```
 
-Data lives in `%APPDATA%\dk.vogg.worklogger\worklogger.db` (SQLite).
+`tauri build` emits platform-appropriate bundles: an NSIS installer on Windows, a `.app`
+plus `.dmg` on macOS (the macOS targets live in `src-tauri/tauri.macos.conf.json`).
+
+On macOS, the global hotkey needs **Accessibility** permission the first time it fires
+(System Settings → Privacy & Security → Accessibility → enable WorkLogger).
+
+Data lives in a per-platform application-data directory:
+
+- **Windows:** `%APPDATA%\dk.vogg.worklogger\worklogger.db`
+- **macOS:** `~/Library/Application Support/dk.vogg.worklogger/worklogger.db`
+- **Linux:** `~/.local/share/dk.vogg.worklogger/worklogger.db`
 
 ### Layout
 
