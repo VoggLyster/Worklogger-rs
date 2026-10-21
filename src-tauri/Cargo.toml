@@ -1,6 +1,6 @@
 [package]
 name = "worklogger"
-version = "0.3.0"
+version = "0.4.0"
 description = "Local task tracker built for context switching"
 authors = ["Søren Lyster"]
 license = "MIT"
@@ -25,7 +25,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
-tokio = { version = "1.54.0", features = ["process", "io-util", "time"] }
+tokio = { version = "1.54.0", features = ["process", "io-util", "time", "macros"] }
 tauri-plugin-global-shortcut = "2.4.1"
 tauri-plugin-single-instance = "2.5.4"
 

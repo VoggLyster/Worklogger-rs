@@ -1,4 +1,4 @@
-import { CalendarDays, History, Keyboard, LayoutList, Settings, X } from "lucide-react";
+import { CalendarDays, CircleDot, History, Keyboard, LayoutList, Settings, X } from "lucide-react";
 import { SHORTCUTS, useHotkeys } from "./lib/hotkeys";
 import { StoreProvider, useStore, type View } from "./lib/store";
 import { FocusView } from "./views/FocusView";
@@ -8,6 +8,7 @@ import { SettingsDialog } from "./views/SettingsDialog";
 import { TaskDrawer } from "./components/TaskDrawer";
 import { ParkDialog } from "./components/ParkDialog";
 import { Modal } from "./components/ui";
+import { IssuePicker } from "./components/Issues";
 
 export default function App() {
   return (
@@ -37,6 +38,7 @@ function Shell() {
       <ParkDialog />
       <WelcomeBack />
       <SettingsDialog />
+      <IssuePicker />
       {helpOpen && (
         <Modal title="Keyboard shortcuts" onClose={() => setHelpOpen(false)} width={440}>
           <table className="w-full text-[13px]">
@@ -58,7 +60,7 @@ function Shell() {
 }
 
 function Header() {
-  const { view, setView, setRecapOpen, setSettingsOpen, setHelpOpen, tasks } = useStore();
+  const { view, setView, setRecapOpen, setSettingsOpen, setHelpOpen, openIssuePicker, tasks } = useStore();
   const counts = {
     active: tasks.filter((t) => t.status === "in_progress").length,
     waiting: tasks.filter((t) => t.status === "waiting").length,
@@ -93,7 +95,10 @@ function Header() {
           </span>
         )}
       </div>
-      <button className="btn btn-ghost ml-2" onClick={() => setRecapOpen(true)} title="Where did I leave off? (R)">
+      <button className="btn btn-ghost ml-2" onClick={() => openIssuePicker()} title="GitHub issues across your repos (I)">
+        <CircleDot size={15} /> Issues
+      </button>
+      <button className="btn btn-ghost" onClick={() => setRecapOpen(true)} title="Where did I leave off? (R)">
         <History size={15} /> Recap
       </button>
       <button className="btn btn-ghost px-2" onClick={() => setHelpOpen(true)} title="Keyboard shortcuts (?)">

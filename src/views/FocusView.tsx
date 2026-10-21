@@ -105,18 +105,18 @@ function FilterBar() {
 }
 
 function GithubSync() {
-  const { prSync, refreshPrs, prs } = useStore();
-  if (!prs.length && !prSync.error) return null;
+  const { githubSync, refreshGithub, prs, issues } = useStore();
+  if (!prs.length && !issues.length && !githubSync.error) return null;
   return (
     <button
       className="ml-auto inline-flex h-7 items-center gap-1.5 rounded-full px-2.5 text-[12px] text-muted hover:text-fg"
-      onClick={() => void refreshPrs()}
-      disabled={prSync.busy}
-      title={prSync.error ?? "Refresh pull requests from GitHub"}
+      onClick={() => void refreshGithub()}
+      disabled={githubSync.busy}
+      title={githubSync.error ?? "Refresh pull requests and issues from GitHub"}
     >
-      {prSync.error ? <TriangleAlert size={13} style={{ color: "var(--warn)" }} /> : <GitPullRequest size={13} />}
-      {prSync.busy ? <Spinner size={11} /> : <RefreshCw size={12} />}
-      {prSync.error ? "GitHub sync failed" : prSync.at ? `PRs synced ${ago(prSync.at)}` : "Sync PRs"}
+      {githubSync.error ? <TriangleAlert size={13} style={{ color: "var(--warn)" }} /> : <GitPullRequest size={13} />}
+      {githubSync.busy ? <Spinner size={11} /> : <RefreshCw size={12} />}
+      {githubSync.error ? "GitHub sync failed" : githubSync.at ? `GitHub synced ${ago(githubSync.at)}` : "Sync GitHub"}
     </button>
   );
 }

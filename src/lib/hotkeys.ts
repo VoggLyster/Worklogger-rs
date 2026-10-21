@@ -4,10 +4,9 @@ import { inTauri } from "./api";
 import { STATUS_ORDER } from "./meta";
 import { useStore } from "./store";
 import { visibleTaskIds } from "./sections";
+import { isMac } from "./platform";
 
-export const isMac =
-  typeof navigator !== "undefined" &&
-  (/Mac|iPhone|iPad|iPod/i.test(navigator.platform || "") || /Mac OS X/i.test(navigator.userAgent || ""));
+export { isMac };
 
 /** Platform-friendly label for the default global hotkey. */
 export const defaultGlobalHotkeyLabel = isMac ? "⌘⌥N" : "Ctrl+Alt+N";
@@ -26,6 +25,7 @@ export const SHORTCUTS: [string, string][] = [
   ["G then F", "Go to Focus"],
   ["G then J", "Go to Journal"],
   ["R", "Welcome-back recap"],
+  ["I", "GitHub issues picker"],
   ["← / →", "Previous / next day (Journal)"],
   ["Esc", "Close / clear"],
   ["?", "This help"],
@@ -99,6 +99,9 @@ export function useHotkeys() {
           break;
         case "r":
           st.setRecapOpen(true);
+          break;
+        case "i":
+          st.openIssuePicker();
           break;
         case "j":
         case "ArrowDown":

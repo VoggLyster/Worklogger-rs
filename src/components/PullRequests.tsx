@@ -5,6 +5,7 @@ import {
   CircleDashed,
   CircleX,
   ExternalLink,
+  EyeOff,
   FileCode,
   GitMerge,
   GitPullRequest,
@@ -13,7 +14,6 @@ import {
   Link2,
   MessageSquare,
   Plus,
-  RefreshCw,
   TriangleAlert,
   X,
   type LucideIcon,
@@ -81,64 +81,9 @@ export function PrChips({ rows }: { rows: PrRow[] }) {
   );
 }
 
-// ---------------------------------------------------------------- drawer panel
+// ---------------------------------------------------------------- drawer card
 
-export function PrPanel({ taskId }: { taskId: number }) {
-  const { prsByTask, linkPr, refreshPrs, prSync } = useStore();
-  const rows = prsByTask.get(taskId) ?? [];
-  const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  const link = async () => {
-    if (!input.trim()) return;
-    setBusy(true);
-    if (await linkPr(taskId, input)) setInput("");
-    setBusy(false);
-  };
-
-  return (
-    <div>
-      <div className="flex items-center gap-2">
-        <div className="text-[12px] font-medium text-muted">Pull requests</div>
-        {rows.length > 0 && (
-          <button
-            className="ml-auto flex items-center gap-1 text-[12px] text-faint hover:text-fg"
-            title="Refresh from GitHub"
-            onClick={() => void refreshPrs(taskId)}
-            disabled={prSync.busy}
-          >
-            {prSync.busy ? <Spinner size={11} /> : <RefreshCw size={12} />}
-            {prSync.at ? `updated ${ago(prSync.at)}` : "refresh"}
-          </button>
-        )}
-      </div>
-      <div className="mt-1 flex flex-col gap-2">
-        {rows.map((r) => (
-          <PrCard key={r.id} row={r} />
-        ))}
-        <div className="flex gap-1">
-          <div className="flex flex-1 items-center gap-1.5 rounded-md border border-line px-2 focus-within:border-accent">
-            <Link2 size={13} className="shrink-0 text-faint" />
-            <input
-              className="h-8 w-full bg-transparent text-[13px] outline-none placeholder:text-faint"
-              placeholder="Paste a PR link or owner/repo#123"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && void link()}
-            />
-          </div>
-          {input.trim() && (
-            <button className="btn" onClick={() => void link()} disabled={busy}>
-              {busy ? <Spinner size={12} /> : "Link"}
-            </button>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function PrCard({ row }: { row: PrRow }) {
+export function PrCard({ row }: { row: PrRow }) {
   const { unlinkPr } = useStore();
   const d = row.data;
   const tone = prTone(d);
@@ -247,7 +192,7 @@ function ReviewBadge({ decision }: { decision: PrSnapshot["review_decision"] }) 
   return null;
 }
 
-function Pill({ children, tone }: { children: React.ReactNode; tone?: "good" | "bad" }) {
+export function Pill({ children, tone }: { children: React.ReactNode; tone?: "good" | "bad" }) {
   const color = tone === "good" ? "var(--pr-open)" : tone === "bad" ? "var(--st-blocked)" : "var(--muted)";
   return (
     <span
@@ -259,7 +204,7 @@ function Pill({ children, tone }: { children: React.ReactNode; tone?: "good" | "
   );
 }
 
-function Section({ title, children, defaultOpen = false }: { title: string; children: React.ReactNode; defaultOpen?: boolean }) {
+export function Section({ title, children, defaultOpen = false }: { title: string; children: React.ReactNode; defaultOpen?: boolean }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
     <div>
@@ -303,7 +248,7 @@ function ThreadView({ path, line, outdated, comments }: { path: string; line: nu
   );
 }
 
-function CommentView({ c, prefix }: { c: PrComment; prefix?: string }) {
+export function CommentView({ c, prefix }: { c: PrComment; prefix?: string }) {
   const [expanded, setExpanded] = useState(false);
   const long = c.body.length > 420;
   const body = long && !expanded ? `${c.body.slice(0, 420).trimEnd()}…` : c.body;
@@ -360,7 +305,7 @@ function Conversation({ d }: { d: PrSnapshot }) {
 
 /** Your open PRs that no task tracks yet. */
 export function PrInbox() {
-  const { untracked, untrackedError, createTaskFromPr, linkPr, selectedId, tasks } = useStore();
+  const { untracked, untrackedError, createTaskFromPr, linkGithub, selectedId, tasks, hiddenRepos, setRepoHidden } = useStore();
   const [collapsed, setCollapsed] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   if (untrackedError) {
@@ -370,7 +315,9 @@ export function PrInbox() {
       </div>
     );
   }
-  if (!untracked?.length) return null;
+  const visible = (untracked ?? []).filter((pr) => !hiddenRepos.has(pr.repo.toLowerCase()));
+  const hiddenCount = (untracked?.length ?? 0) - visible.length;
+  if (!visible.length) return null;
   const selected = tasks.find((t) => t.id === selectedId);
 
   const act = async (pr: SearchPr, fn: () => Promise<unknown>) => {
@@ -385,11 +332,12 @@ export function PrInbox() {
         <ChevronRight size={14} className={`text-faint transition-transform ${collapsed ? "" : "rotate-90"}`} />
         <GitPullRequest size={14} style={{ color: "var(--pr-open)" }} />
         <span className="text-[13px] font-semibold">Untracked PRs</span>
-        <span className="text-[12px] text-faint">{untracked.length}</span>
+        <span className="text-[12px] text-faint">{visible.length}</span>
+        {hiddenCount > 0 && <span className="text-[11px] text-faint">({hiddenCount} hidden)</span>}
       </button>
       {!collapsed && (
         <div className="flex flex-col gap-1">
-          {untracked.map((pr) => (
+          {visible.map((pr) => (
             <div key={pr.url} className="group flex items-center gap-2 rounded-lg border border-dashed border-line px-2.5 py-1.5 text-[13px]">
               {pr.is_draft ? (
                 <GitPullRequestDraft size={14} className="shrink-0 text-faint" />
@@ -411,11 +359,18 @@ export function PrInbox() {
                       <button
                         className="btn px-2 py-0.5 text-[12px]"
                         title={`Link to "${selected.title}"`}
-                        onClick={() => void act(pr, () => linkPr(selected.id, pr.url))}
+                        onClick={() => void act(pr, () => linkGithub(selected.id, pr.url))}
                       >
                         <Link2 size={12} /> Link to selected
                       </button>
                     )}
+                    <button
+                      className="btn btn-ghost px-1.5 py-0.5"
+                      title={`Hide everything from ${pr.repo}`}
+                      onClick={() => void setRepoHidden(pr.repo, true)}
+                    >
+                      <EyeOff size={13} />
+                    </button>
                     <button className="btn px-2 py-0.5 text-[12px]" onClick={() => void act(pr, () => createTaskFromPr(pr))}>
                       <Plus size={12} /> Task
                     </button>

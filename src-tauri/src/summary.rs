@@ -2,7 +2,7 @@
 //! user's existing login) to turn it into a Markdown summary.
 
 use crate::db::{Activity, Project, Task};
-use crate::github::PrSnapshot;
+use crate::github::{IssueSnapshot, PrSnapshot};
 use chrono::{Local, TimeZone};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,8 +44,15 @@ fn fmt_time(ms: i64, with_date: bool) -> String {
 }
 
 pub type PrMap = HashMap<i64, Vec<PrSnapshot>>;
+pub type IssueMap = HashMap<i64, Vec<IssueSnapshot>>;
 
-fn task_header(t: &Task, projects: &HashMap<i64, &Project>, prs: &PrMap) -> String {
+/// GitHub items linked to each task.
+pub struct Linked<'a> {
+    pub prs: &'a PrMap,
+    pub issues: &'a IssueMap,
+}
+
+fn task_header(t: &Task, projects: &HashMap<i64, &Project>, linked: &Linked) -> String {
     let mut bits = vec![t.status.replace('_', " "), format!("P{}", t.priority)];
     if let Some(p) = t.project_id.and_then(|id| projects.get(&id)) {
         bits.push(format!("project: {}", p.name));
@@ -61,8 +68,11 @@ fn task_header(t: &Task, projects: &HashMap<i64, &Project>, prs: &PrMap) -> Stri
         let d: String = t.description.chars().take(400).collect();
         s.push_str(&format!("Description: {}\n", d.replace('\n', " ")));
     }
-    for pr in prs.get(&t.id).into_iter().flatten() {
+    for pr in linked.prs.get(&t.id).into_iter().flatten() {
         s.push_str(&format!("Linked {}\n", pr.digest_line()));
+    }
+    for issue in linked.issues.get(&t.id).into_iter().flatten() {
+        s.push_str(&format!("Linked {}\n", issue.digest_line()));
     }
     s
 }
@@ -80,6 +90,7 @@ fn describe(a: &Activity) -> String {
         "next_step" => format!("next step set: {}", a.body),
         "note" => format!("note: {}", a.body),
         "pr" => format!("PR {}", a.body),
+        "issue" => format!("issue {}", a.body),
         "edited" => format!("edited {}", a.meta.get("fields").map(|f| f.to_string()).unwrap_or_default()),
         other => format!("{other}: {}", a.body),
     }
@@ -93,7 +104,7 @@ pub fn build_digest(
     tasks: &[Task],
     projects: &[Project],
     open_snapshot: &[Task],
-    prs: &PrMap,
+    linked: &Linked,
     multi_day: bool,
 ) -> String {
     let projects: HashMap<i64, &Project> = projects.iter().map(|p| (p.id, p)).collect();
@@ -113,7 +124,7 @@ pub fn build_digest(
     }
     for id in &order {
         let Some(t) = by_id.get(id) else { continue };
-        out.push_str(&task_header(t, &projects, prs));
+        out.push_str(&task_header(t, &projects, linked));
         for a in &groups[id] {
             out.push_str(&format!("- {} {}\n", fmt_time(a.created_at, multi_day), describe(a)));
         }
@@ -123,7 +134,7 @@ pub fn build_digest(
     if !untouched.is_empty() {
         out.push_str("# Other open tasks (no activity in this period)\n\n");
         for t in untouched {
-            out.push_str(&task_header(t, &projects, prs));
+            out.push_str(&task_header(t, &projects, linked));
             out.push_str(&format!("- last updated {}\n\n", fmt_time(t.updated_at, true)));
         }
     }
@@ -269,7 +280,12 @@ mod tests {
                 ..Default::default()
             }],
         );
-        let d = build_digest("Day", &acts, &tasks, &projects, &open, &prs, false);
+        let mut issues = IssueMap::new();
+        issues.insert(
+            1,
+            vec![IssueSnapshot { repo: "o/r".into(), number: 3, title: "Login loops".into(), state: "OPEN".into(), ..Default::default() }],
+        );
+        let d = build_digest("Day", &acts, &tasks, &projects, &open, &Linked { prs: &prs, issues: &issues }, false);
 
         let docs = d.find("## Write docs").unwrap();
         let login = d.find("## Fix login").unwrap();
@@ -282,11 +298,12 @@ mod tests {
         assert!(d.find("## Untouched").unwrap() > other);
         assert_eq!(d.matches("## Fix login").count(), 1, "touched open task not repeated");
         assert!(d.contains("Linked PR o/r#9 \"Fix it\": open, checks: failure"));
+        assert!(d.contains("Linked issue o/r#3 \"Login loops\": open"));
     }
 
     #[test]
     fn empty_digest_says_so() {
-        let d = build_digest("Day", &[], &[], &[], &[], &PrMap::new(), false);
+        let d = build_digest("Day", &[], &[], &[], &[], &Linked { prs: &PrMap::new(), issues: &IssueMap::new() }, false);
         assert!(d.contains("No activity"));
     }
 

@@ -88,10 +88,13 @@ pub fn run() {
             commands::summarize,
             commands::test_claude,
             commands::list_prs,
-            commands::link_pr,
+            commands::list_issues,
+            commands::link_github,
             commands::unlink_pr,
-            commands::refresh_prs,
+            commands::unlink_issue,
+            commands::refresh_github,
             commands::untracked_prs,
+            commands::search_issues,
             commands::test_gh,
         ])
         .run(tauri::generate_context!())

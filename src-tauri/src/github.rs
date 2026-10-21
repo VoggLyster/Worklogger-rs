@@ -1,5 +1,5 @@
-//! Pull request tracking through the GitHub CLI (`gh`), using the user's existing `gh auth` login.
-//! All tracked PRs are fetched with one batched GraphQL query; snapshots are cached in SQLite.
+//! GitHub tracking through the GitHub CLI (`gh`), using the user's existing `gh auth` login: pull requests
+//! and issues linked to tasks. Tracked items are fetched with batched GraphQL queries; snapshots are cached in SQLite.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,13 +9,13 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct PrRef {
+pub struct GhRef {
     pub owner: String,
     pub name: String,
     pub number: i64,
 }
 
-impl PrRef {
+impl GhRef {
     pub fn repo(&self) -> String {
         format!("{}/{}", self.owner, self.name)
     }
@@ -28,10 +28,18 @@ fn valid_ident(s: &str) -> bool {
     !s.is_empty() && s.len() <= 100 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// Accepts `https://github.com/owner/repo/pull/123[/...]` or `owner/repo#123`.
-pub fn parse_pr(input: &str) -> Option<PrRef> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Pr,
+    Issue,
+}
+
+/// Accepts `https://github.com/owner/repo/{pull,issues}/123[/...]` (kind known) or `owner/repo#123`
+/// (kind unknown: GitHub numbers PRs and issues in one sequence, so it has to be looked up).
+pub fn parse_ref(input: &str) -> Option<(GhRef, Option<Kind>)> {
     let s = input.trim();
-    let (owner, name, num) = if let Some(rest) = s
+    let (owner, name, num, kind) = if let Some(rest) = s
         .strip_prefix("https://github.com/")
         .or_else(|| s.strip_prefix("http://github.com/"))
         .or_else(|| s.strip_prefix("github.com/"))
@@ -39,18 +47,30 @@ pub fn parse_pr(input: &str) -> Option<PrRef> {
         let mut parts = rest.split('/');
         let owner = parts.next()?;
         let name = parts.next()?;
-        if parts.next()? != "pull" {
-            return None;
-        }
+        let kind = match parts.next()? {
+            "pull" => Kind::Pr,
+            "issues" => Kind::Issue,
+            _ => return None,
+        };
         let num = parts.next()?.split(['?', '#']).next()?;
-        (owner, name, num)
+        (owner, name, num, Some(kind))
     } else {
         let (repo, num) = s.split_once('#')?;
         let (owner, name) = repo.split_once('/')?;
-        (owner, name, num)
+        (owner, name, num, None)
     };
     let number: i64 = num.parse().ok().filter(|n| *n > 0)?;
-    (valid_ident(owner) && valid_ident(name)).then(|| PrRef { owner: owner.into(), name: name.into(), number })
+    (valid_ident(owner) && valid_ident(name)).then(|| (GhRef { owner: owner.into(), name: name.into(), number }, kind))
+}
+
+/// A PR URL or `owner/repo#123`.
+pub fn parse_pr(input: &str) -> Option<GhRef> {
+    parse_ref(input).filter(|(_, k)| *k != Some(Kind::Issue)).map(|(r, _)| r)
+}
+
+/// An issue URL or `owner/repo#123`.
+pub fn parse_issue(input: &str) -> Option<GhRef> {
+    parse_ref(input).filter(|(_, k)| *k != Some(Kind::Pr)).map(|(r, _)| r)
 }
 
 // ---------------------------------------------------------------- snapshot
@@ -161,18 +181,40 @@ fragment F on PullRequest {
   reviewRequests(first: 10) { nodes { requestedReviewer { ... on User { login } ... on Team { name } } } }
 }"#;
 
-pub fn build_query(prs: &[PrRef]) -> String {
+const ISSUE_FRAGMENT: &str = r#"
+fragment F on Issue {
+  number title url state stateReason body updatedAt closedAt author { login } repository { nameWithOwner }
+  labels(first: 20) { nodes { name color } }
+  assignees(first: 10) { nodes { login } }
+  milestone { title }
+  comments(last: 20) { totalCount nodes { author { login } body createdAt url } }
+  closedByPullRequestsReferences(first: 5, includeClosedPrs: true) { nodes {
+    number title url state repository { nameWithOwner } } }
+}"#;
+
+/// One aliased `repository { <field>(number) }` lookup per ref, sharing the `F` fragment.
+fn build_batch_query(refs: &[GhRef], field: &str, fragment: &str) -> String {
     let mut q = String::from("query {\n  viewer { login }\n");
-    for (i, p) in prs.iter().enumerate() {
-        // Identifiers are validated by parse_pr, so interpolation is safe.
+    for (i, p) in refs.iter().enumerate() {
+        // Identifiers are validated when parsed, so interpolation is safe.
         q.push_str(&format!(
-            "  p{i}: repository(owner: \"{}\", name: \"{}\") {{ pullRequest(number: {}) {{ ...F }} }}\n",
+            "  p{i}: repository(owner: \"{}\", name: \"{}\") {{ {field}(number: {}) {{ ...F }} }}\n",
             p.owner, p.name, p.number
         ));
     }
     q.push('}');
-    q.push_str(FRAGMENT);
+    q.push_str(fragment);
     q
+}
+
+#[cfg(test)]
+pub fn build_query(prs: &[GhRef]) -> String {
+    build_batch_query(prs, "pullRequest", FRAGMENT)
+}
+
+#[cfg(test)]
+pub fn build_issue_query(issues: &[GhRef]) -> String {
+    build_batch_query(issues, "issue", ISSUE_FRAGMENT)
 }
 
 fn s(v: &Value, k: &str) -> String {
@@ -351,6 +393,138 @@ pub fn diff_events(old: &PrSnapshot, new: &PrSnapshot) -> Vec<(&'static str, Str
     ev
 }
 
+// ---------------------------------------------------------------- issues
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Label {
+    pub name: String,
+    /// Hex without '#'.
+    pub color: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ClosingPr {
+    pub repo: String,
+    pub number: i64,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct IssueSnapshot {
+    pub repo: String,
+    pub number: i64,
+    pub title: String,
+    pub url: String,
+    /// OPEN | CLOSED
+    pub state: String,
+    /// COMPLETED | NOT_PLANNED | REOPENED | DUPLICATE | null
+    pub state_reason: Option<String>,
+    pub author: String,
+    /// First part of the issue body (Markdown).
+    pub body: String,
+    pub labels: Vec<Label>,
+    pub assignees: Vec<String>,
+    pub milestone: Option<String>,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub comment_count: i64,
+    pub comments: Vec<Comment>,
+    /// PRs that will close (or closed) this issue.
+    pub closing_prs: Vec<ClosingPr>,
+    pub viewer: String,
+}
+
+impl IssueSnapshot {
+    /// Closed as done (not "not planned" / duplicate).
+    pub fn completed(&self) -> bool {
+        self.state == "CLOSED" && !matches!(self.state_reason.as_deref(), Some("NOT_PLANNED") | Some("DUPLICATE"))
+    }
+
+    pub fn digest_line(&self) -> String {
+        let mut bits = vec![match (self.state.as_str(), self.completed()) {
+            ("OPEN", _) => "open".to_string(),
+            (_, true) => "closed as completed".to_string(),
+            _ => "closed as not planned".to_string(),
+        }];
+        if !self.labels.is_empty() {
+            bits.push(format!("labels: {}", self.labels.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        if !self.assignees.is_empty() {
+            bits.push(format!("assigned: {}", self.assignees.join(", ")));
+        }
+        if self.comment_count > 0 {
+            bits.push(format!("{} comments", self.comment_count));
+        }
+        format!("issue {}#{} \"{}\": {}", self.repo, self.number, self.title, bits.join(", "))
+    }
+}
+
+const ISSUE_BODY_LIMIT: usize = 4000;
+
+pub fn parse_issue_snapshot(v: &Value, viewer: &str) -> IssueSnapshot {
+    let body: String = s(v, "body").chars().take(ISSUE_BODY_LIMIT).collect();
+    IssueSnapshot {
+        repo: v.get("repository").map(|r| s(r, "nameWithOwner")).unwrap_or_default(),
+        number: v.get("number").and_then(Value::as_i64).unwrap_or_default(),
+        title: s(v, "title"),
+        url: s(v, "url"),
+        state: s(v, "state"),
+        state_reason: v.get("stateReason").and_then(Value::as_str).map(String::from),
+        author: login(v),
+        body,
+        labels: nodes(v, &["labels"]).into_iter().map(|l| Label { name: s(l, "name"), color: s(l, "color") }).collect(),
+        assignees: nodes(v, &["assignees"]).into_iter().map(|a| s(a, "login")).collect(),
+        milestone: v.get("milestone").and_then(|m| m.get("title")).and_then(Value::as_str).map(String::from),
+        updated_at: s(v, "updatedAt"),
+        closed_at: v.get("closedAt").and_then(Value::as_str).map(String::from),
+        comment_count: v.get("comments").and_then(|c| c.get("totalCount")).and_then(Value::as_i64).unwrap_or_default(),
+        comments: nodes(v, &["comments"]).into_iter().map(comment).collect(),
+        closing_prs: nodes(v, &["closedByPullRequestsReferences"])
+            .into_iter()
+            .map(|p| ClosingPr {
+                repo: p.get("repository").map(|r| s(r, "nameWithOwner")).unwrap_or_default(),
+                number: p.get("number").and_then(Value::as_i64).unwrap_or_default(),
+                title: s(p, "title"),
+                url: s(p, "url"),
+                state: s(p, "state"),
+            })
+            .collect(),
+        viewer: viewer.to_string(),
+    }
+}
+
+/// Notable changes between two snapshots of the same issue.
+pub fn diff_issue_events(old: &IssueSnapshot, new: &IssueSnapshot) -> Vec<(&'static str, String)> {
+    let mut ev = Vec::new();
+    match (old.state.as_str(), new.state.as_str()) {
+        ("OPEN", "CLOSED") if new.completed() => ev.push(("closed", "Closed as completed".to_string())),
+        ("OPEN", "CLOSED") => ev.push(("closed_not_planned", "Closed as not planned".to_string())),
+        ("CLOSED", "OPEN") => ev.push(("reopened", "Reopened".to_string())),
+        _ => {}
+    }
+    if !new.viewer.is_empty() && new.assignees.contains(&new.viewer) && !old.assignees.contains(&new.viewer) {
+        ev.push(("assigned", "Assigned to you".to_string()));
+    }
+    let seen: HashSet<&str> = old.comments.iter().map(|c| c.url.as_str()).collect();
+    let mut authors: Vec<String> = Vec::new();
+    let mut count = 0;
+    for c in &new.comments {
+        if !seen.contains(c.url.as_str()) && c.author != new.viewer {
+            count += 1;
+            if !authors.contains(&c.author) {
+                authors.push(c.author.clone());
+            }
+        }
+    }
+    if count > 0 {
+        let noun = if count == 1 { "comment" } else { "comments" };
+        ev.push(("comments", format!("{count} new {noun} from {}", authors.join(", "))));
+    }
+    ev
+}
+
 // ---------------------------------------------------------------- gh CLI
 
 pub fn resolve_gh(setting: Option<String>) -> PathBuf {
@@ -412,31 +586,146 @@ async fn run_gh(gh: &Path, cwd: &Path, args: &[&str], stdin: Option<&str>, timeo
     Ok(stdout)
 }
 
-/// Fetch snapshots for many PRs (chunked). Per-PR failures (deleted repo, no access) come back as `Err`.
-pub async fn fetch_prs(gh: &Path, cwd: &Path, prs: &[PrRef]) -> Result<HashMap<PrRef, Result<PrSnapshot, String>>, String> {
-    let mut out = HashMap::new();
-    for chunk in prs.chunks(20) {
-        let query = build_query(chunk);
-        let raw = run_gh(gh, cwd, &["api", "graphql", "-F", "query=@-"], Some(&query), 60).await?;
-        let v: Value = serde_json::from_str(raw.trim()).map_err(|e| format!("Unexpected gh output: {e}: {}", raw.trim()))?;
-        let data = v.get("data").filter(|d| !d.is_null());
-        let Some(data) = data else {
+async fn graphql(gh: &Path, cwd: &Path, query: &str) -> Result<Value, String> {
+    let raw = run_gh(gh, cwd, &["api", "graphql", "-F", "query=@-"], Some(query), 60).await?;
+    let v: Value = serde_json::from_str(raw.trim()).map_err(|e| format!("Unexpected gh output: {e}: {}", raw.trim()))?;
+    match v.get("data").filter(|d| !d.is_null()) {
+        Some(data) => Ok(data.clone()),
+        None => {
             let msg = v.get("errors").and_then(|e| e.get(0)).and_then(|e| e.get("message")).and_then(Value::as_str);
-            return Err(friendly(msg.unwrap_or("GitHub returned no data")));
-        };
+            Err(friendly(msg.unwrap_or("GitHub returned no data")))
+        }
+    }
+}
+
+type Batch<T> = HashMap<GhRef, Result<T, String>>;
+
+/// Fetch many items (chunked). Per-item failures (deleted repo, no access, wrong kind) come back as `Err`.
+async fn fetch_batch<T>(
+    gh: &Path,
+    cwd: &Path,
+    refs: &[GhRef],
+    field: &str,
+    fragment: &str,
+    parse: fn(&Value, &str) -> T,
+) -> Result<Batch<T>, String> {
+    let mut out = HashMap::new();
+    for chunk in refs.chunks(20) {
+        let data = graphql(gh, cwd, &build_batch_query(chunk, field, fragment)).await?;
         let viewer = data.get("viewer").map(|u| s(u, "login")).unwrap_or_default();
-        for (i, p) in chunk.iter().enumerate() {
-            let pr = data.get(format!("p{i}")).and_then(|r| r.get("pullRequest")).filter(|x| !x.is_null());
+        for (i, r) in chunk.iter().enumerate() {
+            let item = data.get(format!("p{i}")).and_then(|x| x.get(field)).filter(|x| !x.is_null());
             out.insert(
-                p.clone(),
-                match pr {
-                    Some(pr) => Ok(parse_snapshot(pr, &viewer)),
-                    None => Err(format!("{} not found or no access", p.label())),
+                r.clone(),
+                match item {
+                    Some(item) => Ok(parse(item, &viewer)),
+                    None => Err(format!("{} not found or no access", r.label())),
                 },
             );
         }
     }
     Ok(out)
+}
+
+pub async fn fetch_prs(gh: &Path, cwd: &Path, prs: &[GhRef]) -> Result<Batch<PrSnapshot>, String> {
+    fetch_batch(gh, cwd, prs, "pullRequest", FRAGMENT, parse_snapshot).await
+}
+
+pub async fn fetch_issues(gh: &Path, cwd: &Path, issues: &[GhRef]) -> Result<Batch<IssueSnapshot>, String> {
+    fetch_batch(gh, cwd, issues, "issue", ISSUE_FRAGMENT, parse_issue_snapshot).await
+}
+
+/// For `owner/repo#123` input: ask GitHub whether the number is a PR or an issue.
+pub async fn resolve_kind(gh: &Path, cwd: &Path, r: &GhRef) -> Result<Kind, String> {
+    let q = format!(
+        "query {{ repository(owner: \"{}\", name: \"{}\") {{ issueOrPullRequest(number: {}) {{ __typename }} }} }}",
+        r.owner, r.name, r.number
+    );
+    let data = graphql(gh, cwd, &q).await?;
+    match data.get("repository").and_then(|x| x.get("issueOrPullRequest")).and_then(|x| x.get("__typename")).and_then(Value::as_str) {
+        Some("PullRequest") => Ok(Kind::Pr),
+        Some("Issue") => Ok(Kind::Issue),
+        _ => Err(format!("{} not found or no access", r.label())),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SearchIssue {
+    pub repo: String,
+    pub number: i64,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+    pub labels: Vec<Label>,
+    pub assignees: Vec<String>,
+    pub author: String,
+    pub comment_count: i64,
+    pub updated_at: String,
+}
+
+/// Which issues to list: those involving the viewer (default), assigned/created/mentioning them,
+/// or every open issue in one repo.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IssueScope {
+    Involves,
+    Assigned,
+    Created,
+    Mentioned,
+    Repo,
+}
+
+pub async fn search_issues(gh: &Path, cwd: &Path, scope: IssueScope, repo: Option<&str>, query: &str) -> Result<Vec<SearchIssue>, String> {
+    let mut args: Vec<String> = vec!["search".into(), "issues".into()];
+    let q = query.trim();
+    if !q.is_empty() {
+        args.push(q.into());
+    }
+    match scope {
+        IssueScope::Involves => args.extend(["--involves".into(), "@me".into()]),
+        IssueScope::Assigned => args.extend(["--assignee".into(), "@me".into()]),
+        IssueScope::Created => args.extend(["--author".into(), "@me".into()]),
+        IssueScope::Mentioned => args.extend(["--mentions".into(), "@me".into()]),
+        IssueScope::Repo => {
+            let repo = repo.filter(|r| r.split_once('/').is_some_and(|(o, n)| valid_ident(o) && valid_ident(n)));
+            let repo = repo.ok_or("Pick a repository (owner/name) to browse")?;
+            args.extend(["--repo".into(), repo.into()]);
+        }
+    }
+    args.extend(
+        ["--state", "open", "--sort", "updated", "--limit", "100", "--json", "number,title,repository,url,state,labels,assignees,author,commentsCount,updatedAt,isPullRequest"]
+            .map(String::from),
+    );
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let raw = run_gh(gh, cwd, &argv, None, 45).await?;
+    let v: Value = serde_json::from_str(raw.trim()).map_err(|e| format!("Unexpected gh output: {e}"))?;
+    Ok(v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|i| !i.get("isPullRequest").and_then(Value::as_bool).unwrap_or(false))
+                .map(|i| SearchIssue {
+                    repo: i.get("repository").map(|r| s(r, "nameWithOwner")).unwrap_or_default(),
+                    number: i.get("number").and_then(Value::as_i64).unwrap_or_default(),
+                    title: s(i, "title"),
+                    url: s(i, "url"),
+                    state: s(i, "state").to_uppercase(),
+                    labels: i
+                        .get("labels")
+                        .and_then(Value::as_array)
+                        .map(|ls| ls.iter().map(|l| Label { name: s(l, "name"), color: s(l, "color") }).collect())
+                        .unwrap_or_default(),
+                    assignees: i
+                        .get("assignees")
+                        .and_then(Value::as_array)
+                        .map(|xs| xs.iter().map(|x| s(x, "login")).collect())
+                        .unwrap_or_default(),
+                    author: login(i),
+                    comment_count: i.get("commentsCount").and_then(Value::as_i64).unwrap_or_default(),
+                    updated_at: s(i, "updatedAt"),
+                })
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -496,7 +785,7 @@ mod tests {
             println!("skipped: set WORKLOGGER_LIVE_PR=owner/repo#123");
             return;
         };
-        let missing = PrRef { number: 999_999_999, ..pr.clone() };
+        let missing = GhRef { number: 999_999_999, ..pr.clone() };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let gh = resolve_gh(None);
         let cwd = std::env::temp_dir();
@@ -512,6 +801,86 @@ mod tests {
         let mine = rt.block_on(my_open_prs(&gh, &cwd)).expect("search");
         println!("{} open PRs authored by viewer", mine.len());
         println!("{}", rt.block_on(auth_status(&gh, &cwd)).unwrap());
+    }
+
+    /// Issues end-to-end: search, kind lookup, batch fetch.
+    /// `cargo test -- --ignored live_issues --nocapture` (uses the first open issue involving you)
+    #[test]
+    #[ignore]
+    fn live_issues() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let gh = resolve_gh(None);
+        let cwd = std::env::temp_dir();
+        let found = rt.block_on(search_issues(&gh, &cwd, IssueScope::Involves, None, "")).expect("search");
+        println!("{} open issues involve you", found.len());
+        let Some(first) = found.first() else { return };
+        let r = parse_issue(&format!("{}#{}", first.repo, first.number)).unwrap();
+        assert_eq!(rt.block_on(resolve_kind(&gh, &cwd, &r)).unwrap(), Kind::Issue);
+        let out = rt.block_on(fetch_issues(&gh, &cwd, std::slice::from_ref(&r))).expect("fetch");
+        let snap = out[&r].as_ref().expect("issue snapshot");
+        println!("state {} | {} labels | {} comments | {} closing PRs", snap.state, snap.labels.len(), snap.comment_count, snap.closing_prs.len());
+        assert_eq!(snap.number, r.number);
+        let by_repo = rt.block_on(search_issues(&gh, &cwd, IssueScope::Repo, Some(&first.repo), "")).expect("repo search");
+        assert!(by_repo.iter().all(|i| i.repo.eq_ignore_ascii_case(&first.repo)));
+    }
+
+    #[test]
+    fn parses_issue_and_ambiguous_references() {
+        let (r, k) = parse_ref("https://github.com/acme/widgets/issues/12#issuecomment-1").unwrap();
+        assert_eq!((r.number, k), (12, Some(Kind::Issue)));
+        assert_eq!(parse_ref("acme/widgets#12").unwrap().1, None, "short form needs a lookup");
+        assert!(parse_pr("https://github.com/acme/widgets/issues/12").is_none());
+        assert!(parse_issue("https://github.com/acme/widgets/pull/12").is_none());
+        assert_eq!(parse_issue("acme/widgets#12").unwrap().number, 12);
+        let q = build_issue_query(&[r]);
+        assert!(q.contains("issue(number: 12)") && q.contains("fragment F on Issue"));
+    }
+
+    fn issue_sample() -> Value {
+        json!({
+            "number": 12, "title": "Crash on save", "url": "https://github.com/acme/widgets/issues/12",
+            "state": "OPEN", "stateReason": null, "body": "Steps:\n1. save", "updatedAt": "t", "closedAt": null,
+            "author": {"login": "alex"}, "repository": {"nameWithOwner": "acme/widgets"},
+            "labels": {"nodes": [{"name": "bug", "color": "d73a4a"}]},
+            "assignees": {"nodes": []},
+            "milestone": {"title": "v2"},
+            "comments": {"totalCount": 1, "nodes": [{"author": {"login": "alex"}, "body": "still happens", "createdAt": "t", "url": "c1"}]},
+            "closedByPullRequestsReferences": {"nodes": [{"number": 40, "title": "Fix save", "url": "u", "state": "OPEN", "repository": {"nameWithOwner": "acme/widgets"}}]}
+        })
+    }
+
+    #[test]
+    fn parses_issue_snapshot() {
+        let i = parse_issue_snapshot(&issue_sample(), "me");
+        assert_eq!((i.repo.as_str(), i.number, i.state.as_str()), ("acme/widgets", 12, "OPEN"));
+        assert_eq!(i.labels[0].name, "bug");
+        assert_eq!(i.milestone.as_deref(), Some("v2"));
+        assert_eq!(i.closing_prs[0].number, 40);
+        assert!(i.digest_line().contains("open, labels: bug, 1 comments"));
+        assert!(!i.completed());
+    }
+
+    #[test]
+    fn issue_diff_detects_close_assign_and_comments() {
+        let old = parse_issue_snapshot(&issue_sample(), "me");
+        assert!(diff_issue_events(&old, &old).is_empty());
+
+        let mut new = old.clone();
+        new.assignees.push("me".into());
+        new.comments.push(Comment { author: "sam".into(), url: "c2".into(), ..Default::default() });
+        new.comments.push(Comment { author: "me".into(), url: "c3".into(), ..Default::default() });
+        let ev: Vec<_> = diff_issue_events(&old, &new);
+        assert_eq!(ev.iter().map(|e| e.0).collect::<Vec<_>>(), vec!["assigned", "comments"]);
+        assert_eq!(ev[1].1, "1 new comment from sam");
+
+        let mut closed = old.clone();
+        closed.state = "CLOSED".into();
+        closed.state_reason = Some("NOT_PLANNED".into());
+        assert_eq!(diff_issue_events(&old, &closed)[0].0, "closed_not_planned");
+        assert!(!closed.completed());
+        closed.state_reason = Some("COMPLETED".into());
+        assert_eq!(diff_issue_events(&old, &closed)[0].0, "closed");
+        assert_eq!(diff_issue_events(&closed, &old)[0].0, "reopened");
     }
 
     #[test]

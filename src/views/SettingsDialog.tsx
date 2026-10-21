@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { Archive } from "lucide-react";
+import { Archive, Eye } from "lucide-react";
 import { api, errorMessage, type HotkeyStatus, type SettingKey } from "../lib/api";
-import { isMac } from "../lib/hotkeys";
+import { isMac } from "../lib/platform";
 import { useStore } from "../lib/store";
 import { Modal, Spinner } from "../components/ui";
 
@@ -66,7 +66,7 @@ function SettingsBody() {
         </div>
       </Group>
 
-      <Group title="GitHub pull requests">
+      <Group title="GitHub">
         <Row label="GitHub CLI" hint="Uses your gh auth login. Leave empty to auto-detect.">
           <input
             className="field"
@@ -93,9 +93,12 @@ function SettingsBody() {
           {ghTest.result && <span className={ghTest.ok ? "text-muted" : "text-[var(--st-blocked)]"}>{ghTest.result}</span>}
         </div>
         <div className="text-[12px] text-faint">
-          PRs refresh on launch, when the window regains focus, and every 5 minutes. A task is marked done when all its
-          linked PRs are merged.
+          PRs and issues refresh on launch, when the window regains focus, and every 5 minutes. A task is marked done
+          when everything linked to it is finished: PRs merged and issues closed.
         </div>
+        <Row label="Hidden repositories" hint="Hidden from the PR inbox and the issue picker. Items you already linked stay.">
+          <HiddenRepos />
+        </Row>
       </Group>
 
       <Group title="Welcome back">
@@ -178,6 +181,38 @@ function SettingsBody() {
           </div>
         ))}
       </Group>
+    </div>
+  );
+}
+
+function HiddenRepos() {
+  const { hiddenRepos, setRepoHidden } = useStore();
+  const [input, setInput] = useState("");
+  const add = () => {
+    const repo = input.trim().replace(/^https?:\/\/github\.com\//, "").replace(/\/$/, "");
+    if (/^[\w.-]+\/[\w.-]+$/.test(repo)) {
+      void setRepoHidden(repo, true);
+      setInput("");
+    }
+  };
+  return (
+    <div className="flex flex-col gap-1.5">
+      {[...hiddenRepos].sort().map((r) => (
+        <div key={r} className="flex items-center gap-2">
+          <span className="flex-1 truncate font-mono text-[12px]">{r}</span>
+          <button className="btn btn-ghost px-2 py-0.5 text-[12px]" onClick={() => void setRepoHidden(r, false)}>
+            <Eye size={13} /> Show
+          </button>
+        </div>
+      ))}
+      {hiddenRepos.size === 0 && <div className="text-faint">None. Hide a repo from the PR inbox or issue picker, or add one here.</div>}
+      <input
+        className="field py-1"
+        placeholder="owner/repo, Enter to hide"
+        value={input}
+        onChange={(e) => setInput(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && add()}
+      />
     </div>
   );
 }

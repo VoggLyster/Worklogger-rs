@@ -6,6 +6,7 @@ import { useStore } from "../lib/store";
 import { ago } from "../lib/time";
 import { PriorityBadge, ProjectChip, StatusMenu } from "./ui";
 import { PrChips } from "./PullRequests";
+import { IssueChips } from "./Issues";
 
 interface Props extends HTMLAttributes<HTMLDivElement> {
   task: Task;
@@ -18,8 +19,9 @@ export const TaskCard = forwardRef<HTMLDivElement, Props>(function TaskCard(
   { task, selected, dragging, style, ...rest },
   ref,
 ) {
-  const { projectById, changeStatus, requestPark, openDrawer, setSelectedId, prsByTask } = useStore();
+  const { projectById, changeStatus, requestPark, openDrawer, setSelectedId, prsByTask, issuesByTask } = useStore();
   const prs = prsByTask.get(task.id);
+  const issues = issuesByTask.get(task.id);
   const project = task.project_id != null ? projectById.get(task.project_id) : undefined;
   const done = task.status === "done";
 
@@ -80,9 +82,10 @@ export const TaskCard = forwardRef<HTMLDivElement, Props>(function TaskCard(
           </span>
         </div>
       </div>
-      {prs && prs.length > 0 && (
-        <div className="mt-1.5 pl-8">
-          <PrChips rows={prs} />
+      {(prs?.length || issues?.length) && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-1.5 pl-8">
+          {prs && <PrChips rows={prs} />}
+          {issues && <IssueChips rows={issues} />}
         </div>
       )}
       {task.next_step && !done && (

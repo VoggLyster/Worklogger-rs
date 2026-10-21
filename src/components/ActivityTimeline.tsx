@@ -1,4 +1,4 @@
-import { Bookmark, CheckCircle2, CornerDownRight, GitPullRequest, MessageSquare, Pencil, Plus, RotateCcw, Signal, Trash2, Waypoints } from "lucide-react";
+import { Bookmark, CheckCircle2, CircleDot, CornerDownRight, GitPullRequest, MessageSquare, Pencil, Plus, RotateCcw, Signal, Trash2, Waypoints } from "lucide-react";
 import type { Activity, ActivityKind } from "../lib/api";
 import { describeActivity } from "../lib/meta";
 import { fmtDayTime, fmtTime } from "../lib/time";
@@ -14,6 +14,7 @@ const ICONS: Record<ActivityKind, typeof Plus> = {
   edited: Pencil,
   next_step: CornerDownRight,
   pr: GitPullRequest,
+  issue: CircleDot,
 };
 
 export function ActivityTimeline({
@@ -32,7 +33,7 @@ export function ActivityTimeline({
         const Icon = ICONS[a.kind] ?? Pencil;
         const hasBody = a.body && a.kind !== "created";
         const prominent = a.kind === "note" || a.kind === "parked" || a.kind === "next_step";
-        const isPr = a.kind === "pr";
+        const isPr = a.kind === "pr" || a.kind === "issue";
         return (
           <li key={a.id} className="group relative flex gap-2.5 py-1.5">
             <Icon size={14} className={`mt-[3px] shrink-0 ${prominent ? "text-accent" : "text-faint"}`} />

@@ -3,7 +3,7 @@ import { CornerDownLeft, Plus } from "lucide-react";
 import { useStore } from "../lib/store";
 import { parseCapture } from "../lib/parseCapture";
 import { PRIORITY, STATUS } from "../lib/meta";
-import { isPrRef } from "../lib/pr";
+import { isGithubRef, isIssueUrl } from "../lib/pr";
 
 export function CaptureBar() {
   const { capture, captureSignal, projectFilter, projectById } = useStore();
@@ -22,11 +22,11 @@ export function CaptureBar() {
   if (parsed.project_name) chips.push(`#${parsed.project_name}`);
   else if (filterProject && text.trim()) chips.push(`#${filterProject.name}`);
   if (parsed.agent) chips.push(`@${parsed.agent}`);
-  if (parsed.link) chips.push(isPrRef(parsed.link) ? "pull request" : "link");
+  if (parsed.link) chips.push(!isGithubRef(parsed.link) ? "link" : isIssueUrl(parsed.link) ? "issue" : "GitHub item");
   if (parsed.next_step) chips.push(`next: ${parsed.next_step}`);
 
   const submit = async () => {
-    if (!parsed.title && !(parsed.link && isPrRef(parsed.link))) return;
+    if (!parsed.title && !(parsed.link && isGithubRef(parsed.link))) return;
     const t = await capture(text);
     if (t) setText("");
   };

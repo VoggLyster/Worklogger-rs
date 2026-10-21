@@ -5,9 +5,12 @@ import type {
   ActivityKind,
   Backend,
   NewTask,
+  IssueRow,
+  IssueSnapshot,
   PrRow,
   PrSnapshot,
   Project,
+  SearchIssue,
   SearchPr,
   Settings,
   Status,
@@ -15,9 +18,17 @@ import type {
   Task,
   TaskPatch,
 } from "./api";
-import { isMac } from "./hotkeys";
+import { isMac } from "./platform";
 
 /** Fake snapshot so the PR UI can be previewed without GitHub. */
+function demoIssue(repo: string, number: number, title: string, extra: Partial<IssueSnapshot> = {}): IssueSnapshot {
+  return {
+    repo, number, title, url: `https://github.com/${repo}/issues/${number}`, state: "OPEN", state_reason: null,
+    author: "alex", body: "", labels: [], assignees: [], milestone: null, updated_at: new Date().toISOString(),
+    closed_at: null, comment_count: 0, comments: [], closing_prs: [], viewer: "you", ...extra,
+  };
+}
+
 function demoSnapshot(repo: string, number: number, title: string, extra: Partial<PrSnapshot> = {}): PrSnapshot {
   return {
     repo, number, title, url: `https://github.com/${repo}/pull/${number}`, state: "OPEN", is_draft: false,
@@ -36,6 +47,8 @@ export function createMemoryBackend(): Backend {
   const activity: Activity[] = [];
   const summaries: Summary[] = [];
   const prs: PrRow[] = [];
+  const issues: IssueRow[] = [];
+  const issueCatalog: SearchIssue[] = [];
   const inbox: SearchPr[] = [];
   const settings: Settings = {};
   const defaultHotkey = isMac ? "cmd+alt+n" : "ctrl+alt+n";
@@ -208,10 +221,32 @@ export function createMemoryBackend(): Backend {
     async listPrs() {
       return clone(prs.filter((p) => !find(p.task_id).archived));
     },
-    async linkPr(taskId, input) {
-      const m = input.trim().match(/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/) ?? input.trim().match(/^([\w.-]+\/[\w.-]+)#(\d+)$/);
-      if (!m) throw new Error(`'${input.trim()}' isn't a GitHub pull request link`);
-      const [repo, number] = [m[1], Number(m[2])];
+    async listIssues() {
+      return clone(issues.filter((i) => !find(i.task_id).archived));
+    },
+    async linkGithub(taskId, input) {
+      const t = input.trim();
+      const url = t.match(/github\.com\/([\w.-]+\/[\w.-]+)\/(pull|issues)\/(\d+)/);
+      const short = t.match(/^([\w.-]+\/[\w.-]+)#(\d+)$/);
+      if (!url && !short) throw new Error(`'${t}' isn't a GitHub pull request or issue link`);
+      const repo = url ? url[1] : short![1];
+      const number = Number(url ? url[3] : short![2]);
+      // Short form: in the preview, numbers found among the demo issues are issues.
+      const isIssue = url ? url[2] === "issues" : issueCatalog.some((i) => i.repo === repo && i.number === number);
+      if (isIssue) {
+        let row = issues.find((i) => i.task_id === taskId && i.repo === repo && i.number === number);
+        if (!row) {
+          const known = issueCatalog.find((i) => i.repo === repo && i.number === number);
+          row = {
+            id: id(), task_id: taskId, repo, number, url: `https://github.com/${repo}/issues/${number}`,
+            data: demoIssue(repo, number, known?.title ?? `Demo issue ${number}`, { labels: known?.labels ?? [], assignees: known?.assignees ?? [] }),
+            fetched_at: Date.now(), fetch_error: null,
+          };
+          issues.push(row);
+          log(taskId, "issue", `${repo}#${number}: linked`, { repo, number, event: "linked" });
+        }
+        return { kind: "issue", pr: null, issue: clone(row) };
+      }
       let row = prs.find((p) => p.task_id === taskId && p.repo === repo && p.number === number);
       if (!row) {
         const fromInbox = inbox.find((p) => p.repo === repo && p.number === number);
@@ -223,15 +258,31 @@ export function createMemoryBackend(): Backend {
         prs.push(row);
         log(taskId, "pr", `${repo}#${number}: linked`, { repo, number, event: "linked" });
       }
-      return clone(row);
+      return { kind: "pr", pr: clone(row), issue: null };
     },
     async unlinkPr(pid) {
       const i = prs.findIndex((p) => p.id === pid);
       if (i >= 0) prs.splice(i, 1);
     },
-    async refreshPrs() {
-      prs.forEach((p) => (p.fetched_at = Date.now()));
-      return { prs: clone(prs), completed: [], error: null, skipped: false };
+    async unlinkIssue(iid) {
+      const i = issues.findIndex((x) => x.id === iid);
+      if (i >= 0) issues.splice(i, 1);
+    },
+    async refreshGithub() {
+      [...prs, ...issues].forEach((p) => (p.fetched_at = Date.now()));
+      return { prs: clone(prs), issues: clone(issues), completed: [], error: null, skipped: false };
+    },
+    async searchIssues(scope, repo, query) {
+      await new Promise((r) => setTimeout(r, 250));
+      if (scope === "repo" && !repo) throw new Error("Pick a repository (owner/name) to browse");
+      const q = query.trim().toLowerCase();
+      return clone(
+        issueCatalog
+          .filter((i) => (scope === "repo" ? i.repo.toLowerCase() === repo!.toLowerCase() : true))
+          .filter((i) => scope !== "assigned" || i.assignees.includes("you"))
+          .filter((i) => scope !== "created" || i.author === "you")
+          .filter((i) => !q || i.title.toLowerCase().includes(q)),
+      );
     },
     async untrackedPrs() {
       return clone(inbox.filter((i) => !prs.some((p) => p.repo === i.repo && p.number === i.number)));
@@ -320,6 +371,39 @@ export function createMemoryBackend(): Backend {
     { repo: "acme/web", number: 415, title: "chore: bump vite to 8.3", url: "https://github.com/acme/web/pull/415", is_draft: false, updated_at: iso(y + 12 * H) },
     { repo: "acme/e2e-tests", number: 9, title: "Add a Safari smoke scenario", url: "https://github.com/acme/e2e-tests/pull/9", is_draft: true, updated_at: iso(y + 10 * H) },
   );
+
+  const bug = { name: "bug", color: "d73a4a" };
+  const perf = { name: "performance", color: "fbca04" };
+  const ux = { name: "ux", color: "a2eeef" };
+  const issue = (repo: string, number: number, title: string, labels: { name: string; color: string }[], assignees: string[], author: string, comments: number, at: number): SearchIssue => ({
+    repo, number, title, url: `https://github.com/${repo}/issues/${number}`, state: "OPEN", labels, assignees, author, comment_count: comments, updated_at: iso(at),
+  });
+  issueCatalog.push(
+    issue("acme/web", 301, "Users get logged out after 15 minutes", [bug], ["you"], "alex", 4, y + 15 * H),
+    issue("acme/api", 77, "Search is slow for large catalogues", [perf], ["you"], "sam", 2, y + 11 * H),
+    issue("acme/web", 318, "Settings page has no dark mode", [ux], [], "you", 0, y + 9 * H),
+    issue("acme/api", 81, "Rate limit public endpoints", [], ["alex"], "you", 6, y + 8 * H),
+    issue("acme/e2e-tests", 14, "Flaky login test on Windows", [bug], [], "sam", 1, y + 7 * H),
+    issue("acme/legacy-site", 5, "Footer links point to old domain", [], [], "alex", 0, y + 5 * H),
+  );
+  issues.push({
+    id: id(), task_id: a.id, repo: "acme/web", number: 301, url: "https://github.com/acme/web/issues/301",
+    fetched_at: Date.now(), fetch_error: null,
+    data: demoIssue("acme/web", 301, "Users get logged out after 15 minutes", {
+      labels: [bug], assignees: ["you"], milestone: "v2.4", comment_count: 2,
+      body: "After the token refresh change, sessions end after **15 minutes** instead of 30 days.\n\nRepro: sign in, wait, reload.",
+      comments: [
+        { author: "sam", body: "Seeing this on Safari too.", created_at: iso(y + 10 * H), url: "ic1" },
+        { author: "alex", body: "Probably the refresh token rotation, see #412.", created_at: iso(y + 14 * H), url: "ic2" },
+      ],
+      closing_prs: [{ repo: "acme/web", number: 412, title: "fix(auth): rotate refresh token before persisting", url: "https://github.com/acme/web/pull/412", state: "OPEN" }],
+    }),
+  });
+  issues.push({
+    id: id(), task_id: b.id, repo: "acme/api", number: 77, url: "https://github.com/acme/api/issues/77",
+    fetched_at: Date.now(), fetch_error: null,
+    data: demoIssue("acme/api", 77, "Search is slow for large catalogues", { labels: [perf], assignees: ["you"], author: "sam", comment_count: 2 }),
+  });
 
   return backend;
 }

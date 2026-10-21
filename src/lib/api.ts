@@ -38,7 +38,8 @@ export type ActivityKind =
   | "reopened"
   | "edited"
   | "next_step"
-  | "pr";
+  | "pr"
+  | "issue";
 
 export interface Activity {
   id: number;
@@ -75,7 +76,15 @@ export type TaskPatch = Partial<
 >;
 
 export type Settings = Partial<Record<SettingKey, string>>;
-export type SettingKey = "claude_path" | "model" | "welcome_gap_hours" | "auto_recap" | "hotkey" | "gh_path";
+export type SettingKey =
+  | "claude_path"
+  | "model"
+  | "welcome_gap_hours"
+  | "auto_recap"
+  | "hotkey"
+  | "gh_path"
+  /** JSON array of "owner/repo" hidden from the PR inbox and issue picker. */
+  | "hidden_repos";
 
 export interface PrComment {
   author: string;
@@ -130,8 +139,67 @@ export interface SearchPr {
   updated_at: string;
 }
 
+export interface IssueLabel {
+  name: string;
+  /** Hex without '#'. */
+  color: string;
+}
+
+export interface IssueSnapshot {
+  repo: string;
+  number: number;
+  title: string;
+  url: string;
+  state: "OPEN" | "CLOSED";
+  state_reason: "COMPLETED" | "NOT_PLANNED" | "REOPENED" | "DUPLICATE" | null;
+  author: string;
+  body: string;
+  labels: IssueLabel[];
+  assignees: string[];
+  milestone: string | null;
+  updated_at: string;
+  closed_at: string | null;
+  comment_count: number;
+  comments: PrComment[];
+  closing_prs: { repo: string; number: number; title: string; url: string; state: string }[];
+  viewer: string;
+}
+
+export interface IssueRow {
+  id: number;
+  task_id: number;
+  repo: string;
+  number: number;
+  url: string;
+  data: IssueSnapshot | null;
+  fetched_at: number | null;
+  fetch_error: string | null;
+}
+
+export interface SearchIssue {
+  repo: string;
+  number: number;
+  title: string;
+  url: string;
+  state: string;
+  labels: IssueLabel[];
+  assignees: string[];
+  author: string;
+  comment_count: number;
+  updated_at: string;
+}
+
+export type IssueScope = "involves" | "assigned" | "created" | "mentioned" | "repo";
+
+export interface LinkResult {
+  kind: "pr" | "issue";
+  pr: PrRow | null;
+  issue: IssueRow | null;
+}
+
 export interface RefreshResult {
   prs: PrRow[];
+  issues: IssueRow[];
   completed: number[];
   error: string | null;
   skipped: boolean;
@@ -161,9 +229,13 @@ export interface Backend {
   testClaude(): Promise<string>;
   hotkeyStatus(): Promise<HotkeyStatus>;
   listPrs(): Promise<PrRow[]>;
-  linkPr(taskId: number, input: string): Promise<PrRow>;
+  listIssues(): Promise<IssueRow[]>;
+  /** Link a PR or issue (URL or owner/repo#123) to a task. */
+  linkGithub(taskId: number, input: string): Promise<LinkResult>;
   unlinkPr(id: number): Promise<void>;
-  refreshPrs(taskId?: number): Promise<RefreshResult>;
+  unlinkIssue(id: number): Promise<void>;
+  refreshGithub(taskId?: number): Promise<RefreshResult>;
+  searchIssues(scope: IssueScope, repo: string | null, query: string): Promise<SearchIssue[]>;
   untrackedPrs(): Promise<SearchPr[]>;
   testGh(): Promise<string>;
   setHotkey(combo: string): Promise<HotkeyStatus>;
@@ -198,9 +270,12 @@ const tauriBackend: Backend = {
   testClaude: () => invoke("test_claude"),
   hotkeyStatus: () => invoke("hotkey_status"),
   listPrs: () => invoke("list_prs"),
-  linkPr: (taskId, input) => invoke("link_pr", { taskId, input }),
+  listIssues: () => invoke("list_issues"),
+  linkGithub: (taskId, input) => invoke("link_github", { taskId, input }),
   unlinkPr: (id) => invoke("unlink_pr", { id }),
-  refreshPrs: (taskId) => invoke("refresh_prs", { taskId: taskId ?? null }),
+  unlinkIssue: (id) => invoke("unlink_issue", { id }),
+  refreshGithub: (taskId) => invoke("refresh_github", { taskId: taskId ?? null }),
+  searchIssues: (scope, repo, query) => invoke("search_issues", { scope, repo, query }),
   untrackedPrs: () => invoke("untracked_prs"),
   testGh: () => invoke("test_gh"),
   setHotkey: (combo) => invoke("set_hotkey", { combo }),

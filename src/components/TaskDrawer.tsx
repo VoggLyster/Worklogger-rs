@@ -7,7 +7,7 @@ import { PRIORITY, STATUS, STATUS_ORDER } from "../lib/meta";
 import { useStore } from "../lib/store";
 import { fmtDayTime } from "../lib/time";
 import { ActivityTimeline } from "./ActivityTimeline";
-import { PrPanel } from "./PullRequests";
+import { GithubPanel } from "./GithubPanel";
 
 export function TaskDrawer() {
   const { drawerId, openDrawer, tasks } = useStore();
@@ -151,7 +151,7 @@ function DrawerBody({ task, onClose }: { task: Task; onClose(): void }) {
         </div>
 
         <div className="mt-4">
-          <PrPanel taskId={task.id} />
+          <GithubPanel taskId={task.id} />
         </div>
 
         <div className="mt-4">

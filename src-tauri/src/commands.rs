@@ -1,7 +1,7 @@
 //! Tauri command layer: thin wrappers around `db` and `summary`.
 
-use crate::db::{self, Activity, NewTask, PrRow, Project, Summary, Task, TaskPatch};
-use crate::github::{self, SearchPr};
+use crate::db::{self, Activity, IssueRow, NewTask, PrRow, Project, Summary, Task, TaskPatch};
+use crate::github::{self, SearchIssue, SearchPr};
 use crate::summary;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -179,7 +179,9 @@ pub async fn summarize(state: State<'_, AppState>, scope: String, from: i64, to:
             (format!("Activity log for {label}"), Vec::new(), false)
         };
         let prs = db::pr_snapshots_by_task(&conn)?;
-        let digest = summary::build_digest(&title, &activity, &tasks, &projects, &open, &prs, prompt_kind);
+        let issues = db::issue_snapshots_by_task(&conn)?;
+        let linked = summary::Linked { prs: &prs, issues: &issues };
+        let digest = summary::build_digest(&title, &activity, &tasks, &projects, &open, &linked, prompt_kind);
         let claude = summary::resolve_claude(db::get_setting(&conn, "claude_path"));
         let model = db::get_setting(&conn, "model").unwrap_or_else(|| "sonnet".into());
         (digest, claude, model)
@@ -196,10 +198,17 @@ pub async fn test_claude(state: State<'_, AppState>) -> R<String> {
     Ok(format!("{} ({})", version, claude.display()))
 }
 
-// ---------------------------------------------------------------- pull requests
+// ---------------------------------------------------------------- GitHub: pull requests and issues
 
 fn gh_path(state: &AppState) -> R<PathBuf> {
     Ok(github::resolve_gh(db::get_setting(&*state.conn()?, "gh_path")))
+}
+
+fn unique_refs(refs: &[(i64, github::GhRef)]) -> Vec<github::GhRef> {
+    let mut u: Vec<github::GhRef> = refs.iter().map(|(_, r)| r.clone()).collect();
+    u.sort_by_key(|r| (r.repo(), r.number));
+    u.dedup();
+    u
 }
 
 #[tauri::command]
@@ -207,20 +216,18 @@ pub fn list_prs(state: State<AppState>) -> R<Vec<PrRow>> {
     db::list_prs(&*state.conn()?)
 }
 
+#[tauri::command]
+pub fn list_issues(state: State<AppState>) -> R<Vec<IssueRow>> {
+    db::list_issues(&*state.conn()?)
+}
+
 /// Fetch the given PR rows and store the results. Holds the DB lock only around reads/writes.
 async fn fetch_and_apply(state: &AppState, rows: Vec<PrRow>) -> R<Vec<i64>> {
-    let refs: Vec<(i64, github::PrRef)> = rows.iter().filter_map(|r| r.pr_ref().map(|p| (r.id, p))).collect();
+    let refs: Vec<(i64, github::GhRef)> = rows.iter().filter_map(|r| r.pr_ref().map(|p| (r.id, p))).collect();
     if refs.is_empty() {
         return Ok(vec![]);
     }
-    let gh = gh_path(state)?;
-    let unique: Vec<github::PrRef> = {
-        let mut u: Vec<github::PrRef> = refs.iter().map(|(_, p)| p.clone()).collect();
-        u.sort_by_key(|p| (p.repo(), p.number));
-        u.dedup();
-        u
-    };
-    let fetched = github::fetch_prs(&gh, &state.data_dir, &unique).await?;
+    let fetched = github::fetch_prs(&gh_path(state)?, &state.data_dir, &unique_refs(&refs)).await?;
     let results = refs
         .into_iter()
         .map(|(id, p)| (id, fetched.get(&p).cloned().unwrap_or_else(|| Err("not fetched".into()))))
@@ -228,15 +235,53 @@ async fn fetch_and_apply(state: &AppState, rows: Vec<PrRow>) -> R<Vec<i64>> {
     db::apply_pr_results(&*state.conn()?, results)
 }
 
-#[tauri::command]
-pub async fn link_pr(state: State<'_, AppState>, task_id: i64, input: String) -> R<PrRow> {
-    let pr = github::parse_pr(&input).ok_or_else(|| format!("'{}' isn't a GitHub pull request link", input.trim()))?;
-    let row = db::link_pr(&*state.conn()?, task_id, &pr)?;
-    // Fetch right away; a failure is stored on the row and shown in the UI.
-    if let Err(e) = fetch_and_apply(&state, vec![row.clone()]).await {
-        let _ = db::apply_pr_results(&*state.conn()?, vec![(row.id, Err(e))]);
+/// Same as [`fetch_and_apply`] for issues.
+async fn fetch_and_apply_issues(state: &AppState, rows: Vec<IssueRow>) -> R<Vec<i64>> {
+    let refs: Vec<(i64, github::GhRef)> = rows.iter().filter_map(|r| r.issue_ref().map(|i| (r.id, i))).collect();
+    if refs.is_empty() {
+        return Ok(vec![]);
     }
-    db::get_pr(&*state.conn()?, row.id)
+    let fetched = github::fetch_issues(&gh_path(state)?, &state.data_dir, &unique_refs(&refs)).await?;
+    let results = refs
+        .into_iter()
+        .map(|(id, i)| (id, fetched.get(&i).cloned().unwrap_or_else(|| Err("not fetched".into()))))
+        .collect();
+    db::apply_issue_results(&*state.conn()?, results)
+}
+
+#[derive(Serialize)]
+pub struct LinkResult {
+    kind: github::Kind,
+    pr: Option<PrRow>,
+    issue: Option<IssueRow>,
+}
+
+/// Link a PR or issue (URL or `owner/repo#123`) to a task and fetch it right away.
+#[tauri::command]
+pub async fn link_github(state: State<'_, AppState>, task_id: i64, input: String) -> R<LinkResult> {
+    let (r, kind) =
+        github::parse_ref(&input).ok_or_else(|| format!("'{}' isn't a GitHub pull request or issue link", input.trim()))?;
+    let kind = match kind {
+        Some(k) => k,
+        None => github::resolve_kind(&gh_path(&state)?, &state.data_dir, &r).await?,
+    };
+    // A fetch failure is stored on the row and shown in the UI, so it doesn't fail the link.
+    match kind {
+        github::Kind::Pr => {
+            let row = db::link_pr(&*state.conn()?, task_id, &r)?;
+            if let Err(e) = fetch_and_apply(&state, vec![row.clone()]).await {
+                let _ = db::apply_pr_results(&*state.conn()?, vec![(row.id, Err(e))]);
+            }
+            Ok(LinkResult { kind, pr: Some(db::get_pr(&*state.conn()?, row.id)?), issue: None })
+        }
+        github::Kind::Issue => {
+            let row = db::link_issue(&*state.conn()?, task_id, &r)?;
+            if let Err(e) = fetch_and_apply_issues(&state, vec![row.clone()]).await {
+                let _ = db::apply_issue_results(&*state.conn()?, vec![(row.id, Err(e))]);
+            }
+            Ok(LinkResult { kind, pr: None, issue: Some(db::get_issue(&*state.conn()?, row.id)?) })
+        }
+    }
 }
 
 #[tauri::command]
@@ -244,32 +289,56 @@ pub fn unlink_pr(state: State<AppState>, id: i64) -> R<()> {
     db::unlink_pr(&*state.conn()?, id)
 }
 
+#[tauri::command]
+pub fn unlink_issue(state: State<AppState>, id: i64) -> R<()> {
+    db::unlink_issue(&*state.conn()?, id)
+}
+
 #[derive(Serialize)]
 pub struct RefreshResult {
     prs: Vec<PrRow>,
-    /// Tasks that were marked done because their PRs merged.
+    issues: Vec<IssueRow>,
+    /// Tasks that were marked done because everything linked to them finished.
     completed: Vec<i64>,
-    /// Set when the whole refresh failed (gh missing, not logged in, offline).
+    /// Set when a whole fetch failed (gh missing, not logged in, offline).
     error: Option<String>,
     skipped: bool,
 }
 
+/// Re-fetch linked PRs and issues (for one task, or all), in parallel.
 #[tauri::command]
-pub async fn refresh_prs(state: State<'_, AppState>, task_id: Option<i64>) -> R<RefreshResult> {
+pub async fn refresh_github(state: State<'_, AppState>, task_id: Option<i64>) -> R<RefreshResult> {
+    let lists = |state: &AppState| -> R<(Vec<PrRow>, Vec<IssueRow>)> {
+        let conn = state.conn()?;
+        Ok((db::list_prs(&conn)?, db::list_issues(&conn)?))
+    };
     if state.refreshing.swap(true, Ordering::SeqCst) {
-        return Ok(RefreshResult { prs: db::list_prs(&*state.conn()?)?, completed: vec![], error: None, skipped: true });
+        let (prs, issues) = lists(&state)?;
+        return Ok(RefreshResult { prs, issues, completed: vec![], error: None, skipped: true });
     }
-    let rows = db::prs_to_refresh(&*state.conn()?, task_id);
-    let outcome = match rows {
-        Ok(rows) => fetch_and_apply(&state, rows).await,
-        Err(e) => Err(e),
+    let rows = (|| -> R<_> {
+        let conn = state.conn()?;
+        Ok((db::prs_to_refresh(&conn, task_id)?, db::issues_to_refresh(&conn, task_id)?))
+    })();
+    let (pr_outcome, issue_outcome) = match rows {
+        Ok((pr_rows, issue_rows)) => {
+            tokio::join!(fetch_and_apply(&state, pr_rows), fetch_and_apply_issues(&state, issue_rows))
+        }
+        Err(e) => (Err(e.clone()), Err(e)),
     };
     state.refreshing.store(false, Ordering::SeqCst);
-    let (completed, error) = match outcome {
-        Ok(c) => (c, None),
-        Err(e) => (vec![], Some(e)),
-    };
-    Ok(RefreshResult { prs: db::list_prs(&*state.conn()?)?, completed, error, skipped: false })
+    let mut completed = Vec::new();
+    let mut errors = Vec::new();
+    for outcome in [pr_outcome, issue_outcome] {
+        match outcome {
+            Ok(c) => completed.extend(c),
+            Err(e) if !errors.contains(&e) => errors.push(e),
+            Err(_) => {}
+        }
+    }
+    let (prs, issues) = lists(&state)?;
+    let error = (!errors.is_empty()).then(|| errors.join("; "));
+    Ok(RefreshResult { prs, issues, completed, error, skipped: false })
 }
 
 /// The user's open PRs that aren't linked to any task yet.
@@ -280,6 +349,18 @@ pub async fn untracked_prs(state: State<'_, AppState>) -> R<Vec<SearchPr>> {
     let linked: std::collections::HashSet<(String, i64)> =
         db::list_prs(&*state.conn()?)?.into_iter().map(|r| (r.repo.to_lowercase(), r.number)).collect();
     Ok(mine.into_iter().filter(|p| !linked.contains(&(p.repo.to_lowercase(), p.number))).collect())
+}
+
+/// Open issues for the issue picker (linked ones included; the UI marks them).
+#[tauri::command]
+pub async fn search_issues(
+    state: State<'_, AppState>,
+    scope: github::IssueScope,
+    repo: Option<String>,
+    query: String,
+) -> R<Vec<SearchIssue>> {
+    let gh = gh_path(&state)?;
+    github::search_issues(&gh, &state.data_dir, scope, repo.as_deref(), &query).await
 }
 
 #[tauri::command]
@@ -329,7 +410,8 @@ mod tests {
 
         let prs = db::pr_snapshots_by_task(&state.conn().unwrap()).unwrap();
         let (activity, tasks) = db::activity_range(&state.conn().unwrap(), 0, i64::MAX).unwrap();
-        let digest = summary::build_digest("Test", &activity, &tasks, &[], &[], &prs, false);
+        let issues = summary::IssueMap::new();
+        let digest = summary::build_digest("Test", &activity, &tasks, &[], &[], &summary::Linked { prs: &prs, issues: &issues }, false);
         println!("{digest}");
         assert!(digest.contains(&format!("Linked PR {}", pr.label())));
     }

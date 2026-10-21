@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::github::{PrRef, PrSnapshot};
+use crate::github::{GhRef, IssueSnapshot, PrSnapshot};
 
 pub type DbResult<T> = Result<T, String>;
 
@@ -84,6 +84,21 @@ const MIGRATIONS: &[&str] = &[
         UNIQUE (task_id, repo, number)
     );
     CREATE INDEX idx_prs_task ON prs(task_id);
+    "#,
+    // v3: GitHub issues linked to tasks, same shape as prs
+    r#"
+    CREATE TABLE issues (
+        id          INTEGER PRIMARY KEY,
+        task_id     INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        repo        TEXT NOT NULL,
+        number      INTEGER NOT NULL,
+        data_json   TEXT,
+        fetched_at  INTEGER,
+        fetch_error TEXT,
+        created_at  INTEGER NOT NULL,
+        UNIQUE (task_id, repo, number)
+    );
+    CREATE INDEX idx_issues_task ON issues(task_id);
     "#,
 ];
 
@@ -582,11 +597,11 @@ pub fn activity_range(conn: &Connection, from: i64, to: i64) -> DbResult<(Vec<Ac
     Ok((acts, tasks))
 }
 
-/// Last activity *by the user* (automated PR events don't count), for the welcome-back gap.
+/// Last activity *by the user* (automated PR/issue events don't count), for the welcome-back gap.
 pub fn last_activity_at(conn: &Connection) -> DbResult<Option<i64>> {
     conn.query_row(
         "SELECT MAX(created_at) FROM activity
-         WHERE kind != 'pr' AND COALESCE(json_extract(meta_json, '$.auto'), 0) = 0",
+         WHERE kind NOT IN ('pr', 'issue') AND COALESCE(json_extract(meta_json, '$.auto'), 0) = 0",
         [],
         |r| r.get(0),
     )
@@ -608,7 +623,7 @@ pub struct PrRow {
 }
 
 impl PrRow {
-    pub fn pr_ref(&self) -> Option<PrRef> {
+    pub fn pr_ref(&self) -> Option<GhRef> {
         crate::github::parse_pr(&format!("{}#{}", self.repo, self.number))
     }
     fn state(&self) -> Option<&str> {
@@ -661,7 +676,7 @@ pub fn prs_to_refresh(conn: &Connection, task_id: Option<i64>) -> DbResult<Vec<P
     Ok(rows.into_iter().filter(|r| r.state() != Some("MERGED")).collect())
 }
 
-pub fn link_pr(conn: &Connection, task_id: i64, pr: &PrRef) -> DbResult<PrRow> {
+pub fn link_pr(conn: &Connection, task_id: i64, pr: &GhRef) -> DbResult<PrRow> {
     let now = now_ms();
     let inserted = conn
         .execute(
@@ -746,23 +761,191 @@ pub fn apply_pr_results(conn: &Connection, results: Vec<(i64, Result<PrSnapshot,
     // Only on the transition to merged, so reopening a task by hand sticks.
     let mut completed = Vec::new();
     for task_id in newly_merged {
-        let task = get_task(&tx, task_id)?;
-        if task.status == "done" {
-            continue;
-        }
-        let prs = query_prs(&tx, "AND p.task_id = ?1", [task_id])?;
-        let all_finished = prs.iter().all(|p| matches!(p.state(), Some("MERGED") | Some("CLOSED")));
-        if all_finished && prs.iter().any(|p| p.state() == Some("MERGED")) {
-            apply_status(&tx, &task, "done", now)?;
-            let body = if prs.len() == 1 { "PR merged" } else { "All linked PRs merged" };
-            let meta = json!({ "from": task.status, "to": "done", "auto": true });
-            log_activity(&tx, task_id, "completed", body, meta, now)?;
-            tx.execute("UPDATE tasks SET updated_at = ?1 WHERE id = ?2", params![now, task_id]).map_err(err)?;
+        if complete_if_all_finished(&tx, task_id, now)? {
             completed.push(task_id);
         }
     }
     tx.commit().map_err(err)?;
     Ok(completed)
+}
+
+/// Mark a task done once everything linked to it is finished: every PR merged or closed, every issue closed,
+/// and at least one PR merged or issue closed as completed. Callers only invoke this right after something
+/// linked finished, so a task reopened by hand stays open.
+fn complete_if_all_finished(tx: &Connection, task_id: i64, now: i64) -> DbResult<bool> {
+    let task = get_task(tx, task_id)?;
+    if task.status == "done" {
+        return Ok(false);
+    }
+    let prs = query_prs(tx, "AND p.task_id = ?1", [task_id])?;
+    let issues = query_issues(tx, "AND i.task_id = ?1", [task_id])?;
+    let prs_finished = prs.iter().all(|p| matches!(p.state(), Some("MERGED") | Some("CLOSED")));
+    let issues_finished = issues.iter().all(|i| i.data.as_ref().is_some_and(|d| d.state == "CLOSED"));
+    let any_success = prs.iter().any(|p| p.state() == Some("MERGED"))
+        || issues.iter().any(|i| i.data.as_ref().is_some_and(|d| d.completed()));
+    if !(prs_finished && issues_finished && any_success) {
+        return Ok(false);
+    }
+    let body = match (prs.len(), issues.len()) {
+        (1, 0) => "PR merged",
+        (_, 0) => "All linked PRs merged",
+        (0, 1) => "Issue closed",
+        (0, _) => "All linked issues closed",
+        _ => "All linked PRs and issues finished",
+    };
+    apply_status(tx, &task, "done", now)?;
+    let meta = json!({ "from": task.status, "to": "done", "auto": true });
+    log_activity(tx, task_id, "completed", body, meta, now)?;
+    tx.execute("UPDATE tasks SET updated_at = ?1 WHERE id = ?2", params![now, task_id]).map_err(err)?;
+    Ok(true)
+}
+
+// ---------------------------------------------------------------- issues
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct IssueRow {
+    pub id: i64,
+    pub task_id: i64,
+    pub repo: String,
+    pub number: i64,
+    pub url: String,
+    pub data: Option<IssueSnapshot>,
+    pub fetched_at: Option<i64>,
+    pub fetch_error: Option<String>,
+}
+
+impl IssueRow {
+    pub fn issue_ref(&self) -> Option<GhRef> {
+        crate::github::parse_issue(&format!("{}#{}", self.repo, self.number))
+    }
+}
+
+const ISSUE_COLS: &str = "i.id, i.task_id, i.repo, i.number, i.data_json, i.fetched_at, i.fetch_error";
+
+fn issue_row(r: &Row) -> rusqlite::Result<IssueRow> {
+    let repo: String = r.get(2)?;
+    let number: i64 = r.get(3)?;
+    let data: Option<String> = r.get(4)?;
+    Ok(IssueRow {
+        id: r.get(0)?,
+        task_id: r.get(1)?,
+        url: format!("https://github.com/{repo}/issues/{number}"),
+        repo,
+        number,
+        data: data.and_then(|d| serde_json::from_str(&d).ok()),
+        fetched_at: r.get(5)?,
+        fetch_error: r.get(6)?,
+    })
+}
+
+fn query_issues(conn: &Connection, filter: &str, p: impl rusqlite::Params) -> DbResult<Vec<IssueRow>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {ISSUE_COLS} FROM issues i JOIN tasks t ON t.id = i.task_id WHERE t.archived = 0 {filter} ORDER BY i.id"
+        ))
+        .map_err(err)?;
+    let rows = stmt.query_map(p, issue_row).map_err(err)?;
+    rows.collect::<Result<_, _>>().map_err(err)
+}
+
+pub fn list_issues(conn: &Connection) -> DbResult<Vec<IssueRow>> {
+    query_issues(conn, "", [])
+}
+
+pub fn get_issue(conn: &Connection, id: i64) -> DbResult<IssueRow> {
+    conn.query_row(&format!("SELECT {ISSUE_COLS} FROM issues i WHERE i.id = ?1"), [id], issue_row).map_err(err)
+}
+
+/// Issues worth re-fetching: not yet seen as closed.
+pub fn issues_to_refresh(conn: &Connection, task_id: Option<i64>) -> DbResult<Vec<IssueRow>> {
+    let rows = match task_id {
+        Some(id) => query_issues(conn, "AND i.task_id = ?1", [id])?,
+        None => query_issues(conn, "", [])?,
+    };
+    Ok(rows.into_iter().filter(|r| r.data.as_ref().map(|d| d.state.as_str()) != Some("CLOSED")).collect())
+}
+
+pub fn link_issue(conn: &Connection, task_id: i64, issue: &GhRef) -> DbResult<IssueRow> {
+    let now = now_ms();
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO issues (task_id, repo, number, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![task_id, issue.repo(), issue.number, now],
+        )
+        .map_err(err)?;
+    if inserted > 0 {
+        let meta = json!({ "repo": issue.repo(), "number": issue.number, "event": "linked" });
+        log_activity(conn, task_id, "issue", &format!("{}: linked", issue.label()), meta, now)?;
+    }
+    conn.query_row(
+        &format!("SELECT {ISSUE_COLS} FROM issues i WHERE i.task_id = ?1 AND i.repo = ?2 AND i.number = ?3"),
+        params![task_id, issue.repo(), issue.number],
+        issue_row,
+    )
+    .map_err(err)
+}
+
+pub fn unlink_issue(conn: &Connection, id: i64) -> DbResult<()> {
+    conn.execute("DELETE FROM issues WHERE id = ?1", [id]).map_err(err)?;
+    Ok(())
+}
+
+/// Store fetched issue snapshots, log notable changes, and complete tasks whose linked work all finished.
+/// Returns the ids of tasks that were auto-completed.
+pub fn apply_issue_results(conn: &Connection, results: Vec<(i64, Result<IssueSnapshot, String>)>) -> DbResult<Vec<i64>> {
+    let now = now_ms();
+    let tx = conn.unchecked_transaction().map_err(err)?;
+    let mut newly_closed: Vec<i64> = Vec::new();
+    for (id, result) in results {
+        let Ok(row) = get_issue(&tx, id) else { continue };
+        match result {
+            Ok(snap) => {
+                if let Some(old) = &row.data {
+                    let events = crate::github::diff_issue_events(old, &snap);
+                    for (event, text) in &events {
+                        let body = format!("{}#{}: {text}", row.repo, row.number);
+                        let meta = json!({ "repo": row.repo, "number": row.number, "event": event });
+                        log_activity(&tx, row.task_id, "issue", &body, meta, now)?;
+                        if event.starts_with("closed") && !newly_closed.contains(&row.task_id) {
+                            newly_closed.push(row.task_id);
+                        }
+                    }
+                    if !events.is_empty() {
+                        tx.execute("UPDATE tasks SET updated_at = ?1 WHERE id = ?2", params![now, row.task_id])
+                            .map_err(err)?;
+                    }
+                }
+                let data = serde_json::to_string(&snap).map_err(|e| e.to_string())?;
+                tx.execute(
+                    "UPDATE issues SET data_json = ?1, fetched_at = ?2, fetch_error = NULL WHERE id = ?3",
+                    params![data, now, id],
+                )
+                .map_err(err)?;
+            }
+            Err(e) => {
+                tx.execute("UPDATE issues SET fetch_error = ?1, fetched_at = ?2 WHERE id = ?3", params![e, now, id])
+                    .map_err(err)?;
+            }
+        }
+    }
+    let mut completed = Vec::new();
+    for task_id in newly_closed {
+        if complete_if_all_finished(&tx, task_id, now)? {
+            completed.push(task_id);
+        }
+    }
+    tx.commit().map_err(err)?;
+    Ok(completed)
+}
+
+pub fn issue_snapshots_by_task(conn: &Connection) -> DbResult<std::collections::HashMap<i64, Vec<IssueSnapshot>>> {
+    let mut map: std::collections::HashMap<i64, Vec<IssueSnapshot>> = std::collections::HashMap::new();
+    for row in list_issues(conn)? {
+        if let Some(d) = row.data {
+            map.entry(row.task_id).or_default().push(d);
+        }
+    }
+    Ok(map)
 }
 
 /// Snapshots per task, for summaries.
@@ -978,6 +1161,72 @@ mod tests {
 
     fn snap(state: &str) -> PrSnapshot {
         PrSnapshot { repo: "o/r".into(), number: 1, state: state.into(), viewer: "me".into(), ..Default::default() }
+    }
+
+    fn issue(state: &str, reason: Option<&str>) -> IssueSnapshot {
+        IssueSnapshot {
+            repo: "o/r".into(),
+            number: 5,
+            state: state.into(),
+            state_reason: reason.map(String::from),
+            viewer: "me".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn issues_link_log_and_complete_tasks() {
+        let c = mem();
+        let t = create_task(&c, NewTask { title: "A".into(), status: Some("in_progress".into()), ..Default::default() }).unwrap();
+        let r = crate::github::parse_issue("o/r#5").unwrap();
+        let i = link_issue(&c, t.id, &r).unwrap();
+        assert_eq!(link_issue(&c, t.id, &r).unwrap().id, i.id, "idempotent");
+        assert_eq!(i.url, "https://github.com/o/r/issues/5");
+
+        apply_issue_results(&c, vec![(i.id, Ok(issue("OPEN", None)))]).unwrap();
+        assert_eq!(kinds(&c, t.id), vec!["created", "issue"], "baseline fetch logs nothing");
+        assert_eq!(get_task(&c, t.id).unwrap().status, "in_progress", "issues don't move tasks to review");
+
+        let mut assigned = issue("OPEN", None);
+        assigned.assignees = vec!["me".into()];
+        apply_issue_results(&c, vec![(i.id, Ok(assigned))]).unwrap();
+        assert_eq!(task_activity(&c, t.id).unwrap()[0].body, "o/r#5: Assigned to you");
+
+        assert_eq!(apply_issue_results(&c, vec![(i.id, Ok(issue("CLOSED", Some("COMPLETED"))))]).unwrap(), vec![t.id]);
+        let last = &task_activity(&c, t.id).unwrap()[0];
+        assert_eq!((last.kind.as_str(), last.body.as_str()), ("completed", "Issue closed"));
+        assert!(issues_to_refresh(&c, None).unwrap().is_empty(), "closed issues are no longer polled");
+        assert_eq!(issue_snapshots_by_task(&c).unwrap()[&t.id][0].state, "CLOSED");
+        unlink_issue(&c, i.id).unwrap();
+        assert!(list_issues(&c).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tasks_wait_for_every_linked_pr_and_issue() {
+        let c = mem();
+        let t = create_task(&c, NewTask { title: "A".into(), ..Default::default() }).unwrap();
+        let p = link_pr(&c, t.id, &crate::github::parse_pr("o/r#1").unwrap()).unwrap();
+        let i = link_issue(&c, t.id, &crate::github::parse_issue("o/r#5").unwrap()).unwrap();
+        apply_pr_results(&c, vec![(p.id, Ok(snap("OPEN")))]).unwrap();
+        apply_issue_results(&c, vec![(i.id, Ok(issue("OPEN", None)))]).unwrap();
+
+        // PR merges but its issue is still open: not done yet.
+        assert!(apply_pr_results(&c, vec![(p.id, Ok(snap("MERGED")))]).unwrap().is_empty());
+        assert_ne!(get_task(&c, t.id).unwrap().status, "done");
+        // The issue closes: now everything is finished.
+        assert_eq!(apply_issue_results(&c, vec![(i.id, Ok(issue("CLOSED", Some("COMPLETED"))))]).unwrap(), vec![t.id]);
+        assert_eq!(task_activity(&c, t.id).unwrap()[0].body, "All linked PRs and issues finished");
+    }
+
+    #[test]
+    fn closing_issues_as_not_planned_does_not_complete() {
+        let c = mem();
+        let t = create_task(&c, NewTask { title: "A".into(), ..Default::default() }).unwrap();
+        let i = link_issue(&c, t.id, &crate::github::parse_issue("o/r#5").unwrap()).unwrap();
+        apply_issue_results(&c, vec![(i.id, Ok(issue("OPEN", None)))]).unwrap();
+        assert!(apply_issue_results(&c, vec![(i.id, Ok(issue("CLOSED", Some("NOT_PLANNED"))))]).unwrap().is_empty());
+        assert_eq!(get_task(&c, t.id).unwrap().status, "todo");
+        assert_eq!(task_activity(&c, t.id).unwrap()[0].body, "o/r#5: Closed as not planned");
     }
 
     #[test]

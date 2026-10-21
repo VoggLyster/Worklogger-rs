@@ -2,8 +2,11 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import {
   api,
   errorMessage,
+  type IssueRow,
+  type LinkResult,
   type PrRow,
   type Project,
+  type SearchIssue,
   type SearchPr,
   type Settings,
   type SettingKey,
@@ -11,7 +14,7 @@ import {
   type Task,
   type TaskPatch,
 } from "./api";
-import { groupByTask, isPrRef } from "./pr";
+import { groupByTask, isGithubRef, parseHiddenRepos } from "./pr";
 import { needsPark } from "./meta";
 import { parseCapture } from "./parseCapture";
 import { startOfDay } from "./time";
@@ -64,10 +67,22 @@ interface Store {
 
   prs: PrRow[];
   prsByTask: Map<number, PrRow[]>;
-  prSync: { at: number | null; busy: boolean; error: string | null };
-  refreshPrs(taskId?: number): Promise<void>;
-  linkPr(taskId: number, input: string): Promise<boolean>;
+  issues: IssueRow[];
+  issuesByTask: Map<number, IssueRow[]>;
+  githubSync: { at: number | null; busy: boolean; error: string | null };
+  refreshGithub(taskId?: number): Promise<void>;
+  /** Link a PR or issue (URL or owner/repo#123). */
+  linkGithub(taskId: number, input: string): Promise<boolean>;
   unlinkPr(id: number): Promise<void>;
+  unlinkIssue(id: number): Promise<void>;
+  /** Issue picker; `taskId` set when opened to link issues to that task. */
+  issuePicker: { taskId: number | null } | null;
+  openIssuePicker(taskId?: number | null): void;
+  closeIssuePicker(): void;
+  createTaskFromIssue(issue: SearchIssue): Promise<void>;
+  /** Lower-cased "owner/repo" hidden from the PR inbox and issue picker. */
+  hiddenRepos: Set<string>;
+  setRepoHidden(repo: string, hidden: boolean): Promise<void>;
   /** The user's open PRs not linked to a task (null until loaded). */
   untracked: SearchPr[] | null;
   untrackedError: string | null;
@@ -111,7 +126,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [searchSignal, setSearchSignal] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [prs, setPrs] = useState<PrRow[]>([]);
-  const [prSync, setPrSync] = useState<Store["prSync"]>({ at: null, busy: false, error: null });
+  const [issues, setIssues] = useState<IssueRow[]>([]);
+  const [issuePicker, setIssuePicker] = useState<Store["issuePicker"]>(null);
+  const [githubSync, setGithubSync] = useState<Store["githubSync"]>({ at: null, busy: false, error: null });
   const [untracked, setUntracked] = useState<SearchPr[] | null>(null);
   const [untrackedError, setUntrackedError] = useState<string | null>(null);
 
@@ -146,18 +163,19 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const refreshPrs = useCallback(
+  const refreshGithub = useCallback(
     async (taskId?: number) => {
-      setPrSync((p) => ({ ...p, busy: true }));
+      setGithubSync((p) => ({ ...p, busy: true }));
       try {
-        const r = await api.refreshPrs(taskId);
+        const r = await api.refreshGithub(taskId);
         setPrs(r.prs);
-        if (r.skipped) setPrSync((p) => ({ ...p, busy: false }));
-        else setPrSync({ at: Date.now(), busy: false, error: r.error });
+        setIssues(r.issues);
+        if (r.skipped) setGithubSync((p) => ({ ...p, busy: false }));
+        else setGithubSync({ at: Date.now(), busy: false, error: r.error });
         // PR events land in the activity log and may have completed tasks.
         await refresh();
       } catch (e) {
-        setPrSync({ at: Date.now(), busy: false, error: errorMessage(e) });
+        setGithubSync({ at: Date.now(), busy: false, error: errorMessage(e) });
       }
       if (taskId == null) void loadUntracked();
     },
@@ -168,8 +186,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   settingsRef.current = settings;
   const recapOpenRef = useRef(recapOpen);
   recapOpenRef.current = recapOpen;
-  const prSyncRef = useRef(prSync);
-  prSyncRef.current = prSync;
+  const githubSyncRef = useRef(githubSync);
+  githubSyncRef.current = githubSync;
 
   /** Set the recap window, and open it if the user has been away longer than the configured gap. */
   const checkWelcomeBack = useCallback((lastAt: number | null) => {
@@ -187,10 +205,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     (async () => {
       let lastAt: number | null = null;
       try {
-        const [s, last, cachedPrs] = await Promise.all([api.getSettings(), api.lastActivityAt(), api.listPrs()]);
+        const [s, last, cachedPrs, cachedIssues] = await Promise.all([
+          api.getSettings(),
+          api.lastActivityAt(),
+          api.listPrs(),
+          api.listIssues(),
+        ]);
         settingsRef.current = s;
         setSettings(s);
         setPrs(cachedPrs);
+        setIssues(cachedIssues);
         lastAt = last;
         await refresh();
       } catch (e) {
@@ -199,17 +223,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setLoaded(true);
       }
       // Let PR changes from while you were away reach the activity log before the recap is written.
-      await Promise.race([refreshPrs(), new Promise((r) => setTimeout(r, 6000))]);
+      await Promise.race([refreshGithub(), new Promise((r) => setTimeout(r, 6000))]);
       checkWelcomeBack(lastAt);
     })();
-  }, [refresh, refreshPrs, checkWelcomeBack]);
+  }, [refresh, refreshGithub, checkWelcomeBack]);
 
   // Keep PRs fresh: on window focus (at most once a minute) and every 5 minutes while visible.
   // Returning to a window that was left open also counts as "welcome back".
   useEffect(() => {
-    const stale = (ms: number) => Date.now() - (prSyncRef.current.at ?? 0) > ms;
+    const stale = (ms: number) => Date.now() - (githubSyncRef.current.at ?? 0) > ms;
     const onFocus = async () => {
-      if (stale(60_000)) void refreshPrs();
+      if (stale(60_000)) void refreshGithub();
       if (!recapOpenRef.current) {
         try {
           checkWelcomeBack(await api.lastActivityAt());
@@ -219,22 +243,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
     };
     const timer = setInterval(() => {
-      if (document.visibilityState === "visible" && stale(4.5 * 60_000)) void refreshPrs();
+      if (document.visibilityState === "visible" && stale(4.5 * 60_000)) void refreshGithub();
     }, 60_000);
     window.addEventListener("focus", onFocus);
     return () => {
       window.removeEventListener("focus", onFocus);
       clearInterval(timer);
     };
-  }, [refreshPrs, checkWelcomeBack]);
+  }, [refreshGithub, checkWelcomeBack]);
 
-  const linkPrRaw = useCallback(
-    async (taskId: number, input: string): Promise<PrRow | null> => {
+  const linkGithubRaw = useCallback(
+    async (taskId: number, input: string): Promise<LinkResult | null> => {
       try {
-        const row = await api.linkPr(taskId, input);
-        setPrs(await api.listPrs());
-        void loadUntracked();
-        return row;
+        const res = await api.linkGithub(taskId, input);
+        const [p, i] = await Promise.all([api.listPrs(), api.listIssues()]);
+        setPrs(p);
+        setIssues(i);
+        if (res.kind === "pr") void loadUntracked();
+        return res;
       } catch (e) {
         setError(errorMessage(e));
         return null;
@@ -287,12 +313,41 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
       prs,
       prsByTask: groupByTask(prs),
-      prSync,
-      refreshPrs,
-      linkPr: async (taskId, input) => {
-        const row = await linkPrRaw(taskId, input);
+      githubSync,
+      refreshGithub,
+      issues,
+      issuesByTask: groupByTask(issues),
+      linkGithub: async (taskId, input) => {
+        const res = await linkGithubRaw(taskId, input);
         await refresh();
-        return row != null;
+        return res != null;
+      },
+      unlinkIssue: async (id) => {
+        await run(() => api.unlinkIssue(id));
+        setIssues(await api.listIssues());
+      },
+      issuePicker,
+      openIssuePicker: (taskId = null) => setIssuePicker({ taskId }),
+      closeIssuePicker: () => setIssuePicker(null),
+      createTaskFromIssue: async (issue) => {
+        const t = await run(() => api.createTask({ title: issue.title, project_id: projectFilter }));
+        if (!t) return;
+        await linkGithubRaw(t.id, issue.url);
+        await refresh();
+        setSelectedId(t.id);
+      },
+      hiddenRepos: parseHiddenRepos(settings),
+      setRepoHidden: async (repo, hidden) => {
+        const set = parseHiddenRepos(settings);
+        if (hidden) set.add(repo.toLowerCase());
+        else set.delete(repo.toLowerCase());
+        try {
+          const value = JSON.stringify([...set].sort());
+          await api.setSetting("hidden_repos", value);
+          setSettings((s) => ({ ...s, hidden_repos: value }));
+        } catch (e) {
+          setError(errorMessage(e));
+        }
       },
       unlinkPr: async (id) => {
         await run(() => api.unlinkPr(id));
@@ -305,27 +360,29 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         const status: Status = pr.is_draft ? "in_progress" : "in_review";
         const t = await run(() => api.createTask({ title: pr.title, status, project_id: projectFilter }));
         if (!t) return;
-        await linkPrRaw(t.id, pr.url);
+        await linkGithubRaw(t.id, pr.url);
         await refresh();
         setSelectedId(t.id);
       },
 
       capture: async (text) => {
         const input = parseCapture(text);
-        const prLink = input.link && isPrRef(input.link) ? input.link : null;
-        // A pasted PR link on its own becomes a task named after the PR.
-        const titleFromPr = !input.title && prLink != null;
-        if (!input.title && !prLink) return null;
-        if (titleFromPr) input.title = prLink!;
+        const ghLink = input.link && isGithubRef(input.link) ? input.link : null;
+        // A pasted PR or issue link on its own becomes a task named after it.
+        const titleFromGh = !input.title && ghLink != null;
+        if (!input.title && !ghLink) return null;
+        if (titleFromGh) input.title = ghLink!;
         if (!input.project_name && projectFilter != null) input.project_id = projectFilter;
         const t = await run(() => api.createTask(input));
         if (!t) return null;
         setSelectedId(t.id);
-        if (prLink) {
-          const row = await linkPrRaw(t.id, prLink);
-          if (titleFromPr && row?.data) {
-            const patch: TaskPatch = { title: row.data.title };
-            if (!input.status) patch.status = row.data.is_draft ? "in_progress" : "in_review";
+        if (ghLink) {
+          const res = await linkGithubRaw(t.id, ghLink);
+          const pr = res?.pr?.data;
+          const issue = res?.issue?.data;
+          if (titleFromGh && (pr || issue)) {
+            const patch: TaskPatch = { title: (pr ?? issue)!.title };
+            if (!input.status && pr) patch.status = pr.is_draft ? "in_progress" : "in_review";
             await api.updateTask(t.id, patch);
           }
           await refresh();
@@ -379,7 +436,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [
     tasks, projects, settings, loaded, version, view, selectedId, drawerId, parkRequest, recap, recapOpen,
     settingsOpen, helpOpen, projectFilter, search, captureSignal, searchSignal, error, run, refresh,
-    prs, prSync, refreshPrs, linkPrRaw, untracked, untrackedError, loadUntracked,
+    prs, issues, issuePicker, githubSync, refreshGithub, linkGithubRaw, untracked, untrackedError, loadUntracked,
   ]);
 
   return <Ctx.Provider value={store}>{children}</Ctx.Provider>;

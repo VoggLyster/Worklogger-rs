@@ -67,6 +67,7 @@ export function describeActivity(a: Activity): string {
     case "note":
       return "Note";
     case "pr":
+    case "issue":
       return a.body;
     case "edited": {
       const f = Array.isArray(a.meta.fields) ? (a.meta.fields as string[]).join(", ") : "";

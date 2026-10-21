@@ -6,12 +6,13 @@ import { ago, fmtDay, fmtDayTime } from "../lib/time";
 import { SummaryPanel } from "../components/SummaryPanel";
 import { Modal, PriorityBadge, StatusIcon } from "../components/ui";
 import { PrChips } from "../components/PullRequests";
+import { IssueChips } from "../components/Issues";
 
 const OPEN: Status[] = ["in_progress", "waiting", "in_review", "blocked"];
 
 /** "Where did I leave everything?" — shown on launch after a break, or from the header. */
 export function WelcomeBack() {
-  const { recap, recapOpen, setRecapOpen, tasks, settings, openDrawer, setSelectedId, prsByTask } = useStore();
+  const { recap, recapOpen, setRecapOpen, tasks, settings, openDrawer, setSelectedId, prsByTask, issuesByTask } = useStore();
   if (!recapOpen) return null;
 
   const open = tasks
@@ -72,9 +73,10 @@ export function WelcomeBack() {
                     <CornerDownRight size={13} className="mt-[3px] shrink-0 text-faint" />
                     {t.next_step || <span className="italic text-faint">No next step written down</span>}
                   </div>
-                  {prsByTask.get(t.id) && (
-                    <div className="mt-1.5 pl-7">
-                      <PrChips rows={prsByTask.get(t.id)!} />
+                  {(prsByTask.get(t.id) || issuesByTask.get(t.id)) && (
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5 pl-7">
+                      {prsByTask.get(t.id) && <PrChips rows={prsByTask.get(t.id)!} />}
+                      {issuesByTask.get(t.id) && <IssueChips rows={issuesByTask.get(t.id)!} />}
                     </div>
                   )}
                 </div>
